@@ -1,0 +1,74 @@
+[
+  {
+    "keyword": "카카오",
+    "type": "percent",
+    "rate": 0.9,
+    "note": "결제금액의 90% (수수료 10%)"
+  },
+  {
+    "keyword": "알리익스프레스",
+    "type": "percent",
+    "rate": 0.91,
+    "note": ""
+  },
+  {
+    "keyword": "자사몰",
+    "type": "percent",
+    "rate": 0.96,
+    "note": ""
+  },
+  {
+    "keyword": "네이버 스마트스토어",
+    "type": "percent",
+    "rate": 0.9,
+    "note": ""
+  },
+  {
+    "keyword": "티딜",
+    "type": "percent",
+    "rate": 0.85,
+    "note": ""
+  },
+  {
+    "keyword": "토스",
+    "type": "percent",
+    "rate": 0.967,
+    "note": ""
+  },
+  {
+    "keyword": "지마켓",
+    "type": "same_as_payment",
+    "rate": 1.0,
+    "note": ""
+  },
+  {
+    "keyword": "옥션",
+    "type": "same_as_payment",
+    "rate": 1.0,
+    "note": ""
+  },
+  {
+    "keyword": "제이슨딜",
+    "type": "same_as_payment",
+    "rate": 1.0,
+    "note": ""
+  },
+  {
+    "keyword": "GS SHOP",
+    "type": "same_as_payment",
+    "rate": 1.0,
+    "note": ""
+  },
+  {
+    "keyword": "NS홈쇼핑",
+    "type": "same_as_payment",
+    "rate": 1.0,
+    "note": ""
+  },
+  {
+    "keyword": "11번가",
+    "type": "same_as_payment",
+    "rate": 1.0,
+    "note": ""
+  }
+]
