@@ -9,6 +9,7 @@
 2. 파이차트 대시보드 (사이트별 정산가/마진 비중, 상품 Top10)
 3. 누적 데이터 검색 (사이트/상품/주문번호/날짜)
 """
+import calendar
 import io
 from datetime import date
 from pathlib import Path
@@ -17,7 +18,8 @@ import pandas as pd
 import plotly.express as px
 import sqlalchemy as sa
 import streamlit as st
-from openpyxl.styles import Font, PatternFill
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+from openpyxl.utils import get_column_letter
 
 import processing as P
 
@@ -85,12 +87,56 @@ def load_all_from_db() -> pd.DataFrame:
 # 최종 결산서(xlsx) 생성
 # ---------------------------------------------------------------------------
 
+ACCOUNTING_FMT = '_-* #,##0_-;-* #,##0_-;_-* "-"_-;_-@_-'
+DATE_HDR_FMT = r'mm"월" dd"일"'
+_THIN = Side(style="thin")
+THIN_BORDER = Border(left=_THIN, right=_THIN, top=_THIN, bottom=_THIN)
+GRAY_FILL = PatternFill("solid", fgColor="FFD3D3D3")
+YELLOW_FILL = PatternFill("solid", fgColor="FFFFFF00")
+BODY_FONT = Font(name="맑은 고딕", size=11)
+TITLE_FONT = Font(name="맑은 고딕", size=18, bold=True)
+DATE_FONT = Font(name="맑은 고딕", size=11, bold=True)
+CENTER = Alignment(horizontal="center", vertical="center")
+
+
+def _month_weekdays(year: int, month: int) -> list[date]:
+    """해당 월의 평일(월~금) 목록. 공휴일은 반영하지 못한다(달력 정보 없음, 근사치)."""
+    n_days = calendar.monthrange(year, month)[1]
+    out = []
+    for d in range(1, n_days + 1):
+        cur = date(year, month, d)
+        if cur.weekday() < 5:
+            out.append(cur)
+    return out
+
+
+def _style_pivot_sheet(ws, n_data_rows: int, money_cols: list[str]):
+    """'행 레이블 / 합계 : ...' 형태 시트 공통 서식(헤더·총합계 노란색, 테두리, 회계서식)."""
+    header_row = 2
+    last_row = header_row + n_data_rows  # 총합계 포함된 마지막 데이터 행
+    for col in ["B"] + money_cols:
+        c = ws[f"{col}{header_row}"]
+        c.fill = YELLOW_FILL
+        c.font = BODY_FONT
+        c.border = THIN_BORDER
+    for r in range(header_row + 1, last_row + 1):
+        for col in ["B"] + money_cols:
+            c = ws[f"{col}{r}"]
+            c.font = BODY_FONT
+            c.border = THIN_BORDER
+            if col in money_cols:
+                c.number_format = ACCOUNTING_FMT
+        if r == last_row:  # 총합계 행
+            for col in ["B"] + money_cols:
+                ws[f"{col}{r}"].fill = YELLOW_FILL
+
+
 def build_output_excel(df: pd.DataFrame, excluded: pd.DataFrame, settlement_date: date) -> bytes:
-    """원본 '최종 결산서' 양식과 동일하게 만든다:
-    - '결산서' 시트: 맨 위에 제목 + 당월누적/당일 매출·마진 요약, 그 아래 전체 원본 행(맛장군/쿠팡 등
-      결산 제외 사이트도 포함하되 매입가/정산가/마진/마진률은 0으로 채움 — 원본 최종본과 동일).
-    - '최종정산가 및 마진' 시트: 결산 대상 사이트만, '행 레이블/합계 : 정산가/합계 : 마진' + 총합계.
-    - '품목별 판매수량' 시트: 전체 상품(사이트 무관) '행 레이블/합계 : 주문수량' + 총합계.
+    """원본 '최종 결산서' 양식(열 너비·행 높이·병합 셀·색상·틀고정·자동필터 포함)과 최대한
+    동일하게 만든다. 단 두 가지는 원본과 다르다:
+    - 원본은 날짜별 매출 칸이 수식(SUM)으로 연결돼 있는데, 여기서는 그 시점에 계산된 값을
+      그대로 채워 넣는다(매번 새로 생성되는 파일이라 하나로 이어지는 수식을 유지할 수 없음).
+    - 날짜 트래커는 평일(월~금)만 나열한다. 추석 등 공휴일 달력 정보가 없어 반영하지 못했다.
     """
     site_summary = P.summarize_by_site(df)
     full_raw = pd.concat([df, excluded]).sort_index()
@@ -99,8 +145,7 @@ def build_output_excel(df: pd.DataFrame, excluded: pd.DataFrame, settlement_date
     for col in ["매입가", "정산가", "마진", "마진률"]:
         if col in sheet_df.columns:
             sheet_df[col] = sheet_df[col].fillna(0)
-    if "적용규칙" in sheet_df.columns:
-        sheet_df["적용규칙"] = sheet_df["적용규칙"].fillna("결산 대상 아님")
+    sheet_df = sheet_df[[c for c in P.RAW_COLUMNS if c in sheet_df.columns]]
 
     product_all = (
         full_raw.groupby("고객선택옵션", dropna=False)["주문수량"].sum()
@@ -136,28 +181,120 @@ def build_output_excel(df: pd.DataFrame, excluded: pd.DataFrame, settlement_date
     month_rev = month_prior_rev + today_rev
     month_margin = month_prior_margin + today_margin
 
+    def day_totals(d: date):
+        ds = d.isoformat()
+        if ds == date_str:
+            return today_rev, today_margin
+        if not db_df.empty:
+            hit = db_df[db_df["결산일자"] == ds]
+            if not hit.empty:
+                return float(hit["정산가"].sum()), float(hit["마진"].sum())
+        return None, None
+
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        # ---------------- 결산서 ----------------
         sheet_df.to_excel(writer, sheet_name="결산서", index=False, startrow=8, startcol=1)
         ws = writer.sheets["결산서"]
-        ws["B1"] = f"{settlement_date.month:02d}월 {settlement_date.day:02d}일 산지로드 결산서"
-        ws["B1"].font = Font(bold=True, size=14)
-        labels_values = [
-            ("D2", "당월 누적 매출", "F2", month_rev),
-            ("D3", "당월 누적 마진", "F3", month_margin),
-            ("D4", "당일 매출", "F4", today_rev),
-            ("D5", "당일 마진", "F5", today_margin),
-        ]
-        yellow = PatternFill("solid", fgColor="FFFF00")
-        for label_cell, label_text, value_cell, value in labels_values:
-            ws[label_cell] = label_text
-            ws[label_cell].fill = yellow
-            ws[label_cell].font = Font(bold=True)
-            ws[value_cell] = value
-            ws[value_cell].number_format = "#,##0"
+        last_row = 9 + len(sheet_df)
 
+        widths = {
+            "A": 6.29, "B": 30.57, "C": 49.0, "D": 12.71, "E": 17.43, "F": 15.14,
+            "G": 13.57, "H": 13.29, "I": 9.57, "J": 11.0, "K": 11.71, "L": 25.71,
+            "M": 31.43, "N": 18.43, "O": 10.71, "P": 13.14, "Q": 14.43, "S": 14.29,
+            "T": 13.14, "U": 14.43, "V": 13.14, "X": 14.43, "Y": 14.29, "Z": 14.43,
+            "AA": 14.0, "AB": 13.57, "AC": 9.14,
+        }
+        for col, w in widths.items():
+            ws.column_dimensions[col].width = w
+        for r in [1, 3, 4, 5, 6, 7, 8, 9]:
+            ws.row_dimensions[r].height = 16.5
+
+        ws.freeze_panes = "A10"
+        ws.auto_filter.ref = f"B9:AB{last_row}"
+
+        ws.merge_cells("B1:L3")
+        ws.merge_cells("B4:C8")
+        ws.merge_cells("D4:E4"); ws.merge_cells("F4:G4")
+        ws.merge_cells("D5:E5"); ws.merge_cells("F5:G5")
+        ws.merge_cells("D6:E6"); ws.merge_cells("F6:G6")
+        ws.merge_cells("D7:E7"); ws.merge_cells("F7:G7")
+        ws.merge_cells("D8:L8")
+        ws.merge_cells("H4:L7")
+
+        ws["B1"] = f"{settlement_date.month:02d}월 {settlement_date.day:02d}일 산지로드 결산서"
+        ws["B1"].font = TITLE_FONT
+        ws["B1"].alignment = CENTER
+
+        for label_cell, label_text, value_cell, value in [
+            ("D4", "당월 누적 매출", "F4", month_rev),
+            ("D5", "당월 누적 마진", "F5", month_margin),
+            ("D6", "당일 매출", "F6", today_rev),
+            ("D7", "당일 마진", "F7", today_margin),
+        ]:
+            lc = ws[label_cell]
+            lc.value = label_text
+            lc.font = BODY_FONT
+            lc.fill = YELLOW_FILL
+            lc.border = THIN_BORDER
+            lc.alignment = CENTER
+            vc = ws[value_cell]
+            vc.value = value
+            vc.font = BODY_FONT
+            vc.number_format = ACCOUNTING_FMT
+            vc.border = THIN_BORDER
+            vc.alignment = CENTER
+
+        # 날짜 트래커 (평일 12개씩 두 줄 — 원본의 P~AA 12칸 구성과 동일한 폭)
+        weekdays = _month_weekdays(settlement_date.year, settlement_date.month)
+        batch1, batch2 = weekdays[:12], weekdays[12:24]
+        ws["O3"] = "당일매출"; ws["O3"].font = BODY_FONT
+        ws["O4"] = "당일마진"; ws["O4"].font = BODY_FONT
+        ws["O6"] = "당일매출"; ws["O6"].font = BODY_FONT
+        ws["O7"] = "당일마진"; ws["O7"].font = BODY_FONT
+        for batch, date_row, rev_row, margin_row in [(batch1, 2, 3, 4), (batch2, 5, 6, 7)]:
+            for i, d in enumerate(batch):
+                col = get_column_letter(16 + i)  # P부터
+                dcell = ws[f"{col}{date_row}"]
+                dcell.value = d
+                dcell.number_format = DATE_HDR_FMT
+                dcell.font = DATE_FONT
+                dcell.fill = YELLOW_FILL
+                rev, margin = day_totals(d)
+                if rev is not None:
+                    rc = ws[f"{col}{rev_row}"]
+                    rc.value = rev
+                    rc.number_format = ACCOUNTING_FMT
+                    mc = ws[f"{col}{margin_row}"]
+                    mc.value = margin
+                    mc.number_format = ACCOUNTING_FMT
+
+        for col in list("BCDEFGHIJKLMN"):
+            c = ws[f"{col}9"]
+            c.font = BODY_FONT
+            c.fill = GRAY_FILL
+            c.border = THIN_BORDER
+        for r in range(10, last_row + 1):
+            for col in list("BCDEFGHIJKLMN"):
+                ws[f"{col}{r}"].border = THIN_BORDER
+            for col in ["E", "F", "G", "H", "I", "J"]:
+                ws[f"{col}{r}"].number_format = ACCOUNTING_FMT
+            ws[f"K{r}"].number_format = "0%"
+
+        # ---------------- 최종정산가 및 마진 ----------------
         site_tbl.to_excel(writer, sheet_name="최종정산가 및 마진", index=False, startrow=1, startcol=1)
+        ws2 = writer.sheets["최종정산가 및 마진"]
+        ws2.column_dimensions["B"].width = 30.57
+        ws2.column_dimensions["C"].width = 15.43
+        ws2.column_dimensions["D"].width = 14.29
+        _style_pivot_sheet(ws2, len(site_tbl), ["C", "D"])
+
+        # ---------------- 품목별 판매수량 ----------------
         product_all.to_excel(writer, sheet_name="품목별 판매수량", index=False, startrow=1, startcol=1)
+        ws3 = writer.sheets["품목별 판매수량"]
+        ws3.column_dimensions["B"].width = 70.29
+        ws3.column_dimensions["C"].width = 16.71
+        _style_pivot_sheet(ws3, len(product_all), ["C"])
 
     buf.seek(0)
     return buf.read()
