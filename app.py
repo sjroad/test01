@@ -98,6 +98,73 @@ def load_all_from_db() -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
+# 담당자 검토용 "임시 저장(초안)"
+#
+# 4번 단계(담당자별 검토)를 세션 상태로만 두면, 담당자마다 각자 컴퓨터에서 따로
+# 접속했을 때 서로의 작업이 보이지 않는다(브라우저 세션이 사람마다 분리되어 있음).
+# 그래서 결산일자를 키로 DB에 "초안"을 저장해두고, 어느 담당자든 접속해서 그 날짜를
+# 고르면 지금까지 반영된 최신 상태를 불러와 자기 몫만 반영한 뒤 바로 다시 저장한다.
+# ---------------------------------------------------------------------------
+
+def ensure_draft_schema(engine: sa.Engine):
+    with engine.begin() as conn:
+        for table in ("drafts", "drafts_excluded"):
+            conn.execute(sa.text(
+                f"""
+                CREATE TABLE IF NOT EXISTS {table} (
+                    "결산일자" TEXT, "판매사" TEXT, "고객선택옵션" TEXT, "주문수량" REAL,
+                    "공급사배송비" REAL, "결제금액" REAL, "매입단가" REAL, "매입가" REAL,
+                    "정산가" REAL, "마진" REAL, "마진률" REAL, "적용규칙" TEXT,
+                    "비고" TEXT, "판매사주문번호" TEXT, "수령인연락처" TEXT
+                )
+                """
+            ))
+
+
+def save_draft(df: pd.DataFrame, excluded: pd.DataFrame, settlement_date: date):
+    engine = get_engine()
+    ensure_draft_schema(engine)
+    date_str = settlement_date.isoformat()
+    with engine.begin() as conn:
+        conn.execute(sa.text('DELETE FROM drafts WHERE "결산일자" = :d'), {"d": date_str})
+        conn.execute(sa.text('DELETE FROM drafts_excluded WHERE "결산일자" = :d'), {"d": date_str})
+    out = df.copy()
+    out.insert(0, "결산일자", date_str)
+    out.to_sql("drafts", engine, if_exists="append", index=False)
+    out_ex = excluded.copy()
+    out_ex.insert(0, "결산일자", date_str)
+    out_ex.to_sql("drafts_excluded", engine, if_exists="append", index=False)
+
+
+def load_draft(date_str: str) -> tuple[pd.DataFrame, pd.DataFrame]:
+    engine = get_engine()
+    ensure_draft_schema(engine)
+    try:
+        df = pd.read_sql(
+            sa.text('SELECT * FROM drafts WHERE "결산일자" = :d'), engine, params={"d": date_str}
+        )
+        excluded = pd.read_sql(
+            sa.text('SELECT * FROM drafts_excluded WHERE "결산일자" = :d'), engine, params={"d": date_str}
+        )
+    except Exception:
+        return pd.DataFrame(), pd.DataFrame()
+    for frame in (df, excluded):
+        if not frame.empty and "결산일자" in frame.columns:
+            frame.drop(columns=["결산일자"], inplace=True)
+    return df, excluded
+
+
+def list_draft_dates() -> list[str]:
+    engine = get_engine()
+    ensure_draft_schema(engine)
+    try:
+        d = pd.read_sql('SELECT DISTINCT "결산일자" FROM drafts ORDER BY "결산일자" DESC', engine)
+        return d["결산일자"].tolist()
+    except Exception:
+        return []
+
+
+# ---------------------------------------------------------------------------
 # 최종 결산서(xlsx) 생성
 # ---------------------------------------------------------------------------
 
@@ -446,7 +513,29 @@ with tab_upload:
 
             st.caption("계산 결과")
             st.dataframe(result.df, use_container_width=True, height=350)
-            st.session_state["last_result_df"] = result.df
+
+            # 이 날짜의 검토용 데이터(초안)를 DB에 저장 — 담당자들이 각자 다른 시간/컴퓨터에서
+            # 접속해 4번 단계를 이어받을 수 있도록 함. 이미 진행 중인 초안이 있으면 담당자 검토
+            # 내용을 실수로 날리지 않도록 확인 없이 덮어쓰지 않는다.
+            existing_draft_df, _ = load_draft(settlement_date.isoformat())
+            if existing_draft_df.empty:
+                save_draft(result.df, result.excluded, settlement_date)
+                st.caption(
+                    "✅ 이 날짜의 검토용 데이터를 저장했습니다 — 담당자들이 4번에서 각자 접속해 "
+                    "바로 검토할 수 있습니다."
+                )
+            else:
+                st.warning(
+                    "⚠ 이 날짜는 이미 담당자 검토가 진행 중인 데이터가 있습니다. 지금 다시 계산한 "
+                    "값으로 덮어쓰면 지금까지의 담당자 검토 내용이 사라집니다."
+                )
+                if st.button(
+                    "이 날짜의 검토 데이터를 지금 계산한 값으로 초기화 (기존 검토 내용 삭제됨)",
+                    key="reset_draft",
+                ):
+                    save_draft(result.df, result.excluded, settlement_date)
+                    st.success("초기화했습니다.")
+                    st.rerun()
 
     # -----------------------------------------------------------------
     # 3. 결산서 최종본 다운로드 — 1번 업로드 전에도 버튼은 항상 보이되,
@@ -472,55 +561,62 @@ with tab_upload:
 
     # -----------------------------------------------------------------
     # 4. 담당자별 수정/검토 파일 업로드
+    #    — 브라우저 세션이 아니라 DB에 결산일자별 "초안"을 저장해두는 방식이라,
+    #      담당자마다 각자 다른 시간·다른 컴퓨터에서 접속해 올려도 된다.
     # -----------------------------------------------------------------
     st.subheader("4. 담당자별 수정/검토 파일 업로드")
     st.caption(
         "위 3번에서 받은 '결산서 최종본'을 담당자가 열어 담당 사이트의 매입단가(원가)만 "
         "확인/수정한 뒤 그대로 다시 올려주세요. 본인 담당이 아닌 사이트 행은 값이 "
-        "바뀌어 있어도 전부 무시되니, 실수로 다른 사이트를 건드려도 반영되지 않습니다."
+        "바뀌어 있어도 전부 무시되니, 실수로 다른 사이트를 건드려도 반영되지 않습니다. "
+        "**세 명이 동시에 접속할 필요 없이, 각자 편한 때 올리면 그 즉시 저장됩니다.**"
     )
 
+    draft_dates = list_draft_dates()
     working_df = None
-    if result is not None:
-        base_sig = f"{settlement_date.isoformat()}::{len(raw)}"
-        if st.session_state.get("reviewed_base_sig") != base_sig:
-            st.session_state["reviewed_df"] = result.df.copy()
-            st.session_state["reviewed_base_sig"] = base_sig
-        working_df = st.session_state["reviewed_df"]
-
-    reviewer_cols = st.columns(len(P.REVIEWER_SITE_KEYWORDS))
-    for col, (name, keywords) in zip(reviewer_cols, P.REVIEWER_SITE_KEYWORDS.items()):
-        with col:
-            st.markdown(f"**{name}**")
-            st.caption(", ".join(keywords))
-            rfile = st.file_uploader(
-                f"{name} 검토 파일", type=["xlsx"], key=f"reviewer_{name}",
-                disabled=result is None,
-            )
-            if rfile is not None and working_df is not None:
-                try:
-                    reviewed_raw = P.read_raw_settlement(rfile)
-                except Exception as e:
-                    st.error(f"파일을 읽는 중 오류가 발생했습니다: {e}")
-                    reviewed_raw = None
-                if reviewed_raw is not None:
-                    working_df, stats = P.apply_reviewer_corrections(
-                        working_df, reviewed_raw, keywords
-                    )
-                    st.success(
-                        f"담당 {stats['owned_rows']:,}행 중 매입단가 "
-                        f"{stats['changed_rows']:,}건 반영"
-                    )
-                    if stats["ignored_rows"] > 0:
-                        st.caption(
-                            f"※ 다른 담당자 사이트 행 {stats['ignored_rows']:,}건은 무시했습니다."
-                        )
-
-    if result is None:
-        st.caption("먼저 1번에서 취합 결산서를 업로드하면 검토 파일을 올릴 수 있습니다.")
+    review_excluded = pd.DataFrame()
+    review_date_str = None
+    if not draft_dates:
+        st.info("아직 처리된 결산서가 없습니다. 먼저 1번에서 취합 결산서를 업로드/처리해 주세요.")
     else:
-        st.session_state["reviewed_df"] = working_df
-        unassigned = P.unassigned_sites(result.df)
+        default_idx = (
+            draft_dates.index(settlement_date.isoformat())
+            if settlement_date.isoformat() in draft_dates else 0
+        )
+        review_date_str = st.selectbox(
+            "검토할 결산일자", draft_dates, index=default_idx, key="review_date_select"
+        )
+        working_df, review_excluded = load_draft(review_date_str)
+
+        reviewer_cols = st.columns(len(P.REVIEWER_SITE_KEYWORDS))
+        for col, (name, keywords) in zip(reviewer_cols, P.REVIEWER_SITE_KEYWORDS.items()):
+            with col:
+                st.markdown(f"**{name}**")
+                st.caption(", ".join(keywords))
+                rfile = st.file_uploader(
+                    f"{name} 검토 파일", type=["xlsx"], key=f"reviewer_{name}_{review_date_str}"
+                )
+                if rfile is not None:
+                    try:
+                        reviewed_raw = P.read_raw_settlement(rfile)
+                    except Exception as e:
+                        st.error(f"파일을 읽는 중 오류가 발생했습니다: {e}")
+                        reviewed_raw = None
+                    if reviewed_raw is not None:
+                        working_df, stats = P.apply_reviewer_corrections(
+                            working_df, reviewed_raw, keywords
+                        )
+                        save_draft(working_df, review_excluded, date.fromisoformat(review_date_str))
+                        st.success(
+                            f"담당 {stats['owned_rows']:,}행 중 매입단가 "
+                            f"{stats['changed_rows']:,}건 반영 (저장 완료)"
+                        )
+                        if stats["ignored_rows"] > 0:
+                            st.caption(
+                                f"※ 다른 담당자 사이트 행 {stats['ignored_rows']:,}건은 무시했습니다."
+                            )
+
+        unassigned = P.unassigned_sites(working_df) if not working_df.empty else []
         if unassigned:
             st.caption(
                 "⚠ 세 담당자 누구에게도 배정되지 않아 검토 대상에서 빠진 사이트: "
@@ -531,22 +627,26 @@ with tab_upload:
     # 5. 담당자 검토 반영 후 결산서 최종본 다운로드
     # -----------------------------------------------------------------
     st.subheader("5. 결산서 최종본 다운로드 (담당자 검토 반영)")
+    has_review = working_df is not None and not working_df.empty
+    review_date_obj = date.fromisoformat(review_date_str) if review_date_str else None
     col_c, col_d = st.columns(2)
     with col_c:
-        if st.button("💾 누적 DB에 저장 (검토 반영본)", key="save_reviewed", disabled=working_df is None):
-            save_to_db(working_df, settlement_date)
-            st.success(f"{settlement_date} 데이터를(검토 반영본) 누적 DB에 저장했습니다.")
-            st.session_state["_reload_db"] = True
+        if st.button("💾 누적 DB에 저장 (검토 반영본)", key="save_reviewed", disabled=not has_review):
+            save_to_db(working_df, review_date_obj)
+            st.success(f"{review_date_obj} 데이터를(검토 반영본) 누적 DB에 저장했습니다.")
     with col_d:
         st.download_button(
             "⬇️ 결산서 최종본 다운로드 (검토 반영, .xlsx)",
-            data=build_output_excel(working_df, result.excluded, settlement_date) if working_df is not None else b"",
-            file_name=f"{settlement_date.strftime('%m%d')}_산지로드_결산_최종_검토반영.xlsx",
+            data=build_output_excel(working_df, review_excluded, review_date_obj) if has_review else b"",
+            file_name=(
+                f"{review_date_obj.strftime('%m%d')}_산지로드_결산_최종_검토반영.xlsx"
+                if review_date_obj else "결산_최종_검토반영.xlsx"
+            ),
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             key="download_reviewed",
-            disabled=working_df is None,
+            disabled=not has_review,
         )
-    if working_df is None:
+    if not has_review:
         st.caption("먼저 1번에서 취합 결산서를 업로드하면 활성화됩니다.")
 
 # ---------------------------------------------------------------------------
