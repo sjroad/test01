@@ -17,6 +17,7 @@ import pandas as pd
 import plotly.express as px
 import sqlalchemy as sa
 import streamlit as st
+from openpyxl.styles import Font, PatternFill
 
 import processing as P
 
@@ -84,15 +85,80 @@ def load_all_from_db() -> pd.DataFrame:
 # 최종 결산서(xlsx) 생성
 # ---------------------------------------------------------------------------
 
-def build_output_excel(df: pd.DataFrame) -> bytes:
+def build_output_excel(df: pd.DataFrame, excluded: pd.DataFrame, settlement_date: date) -> bytes:
+    """원본 '최종 결산서' 양식과 동일하게 만든다:
+    - '결산서' 시트: 맨 위에 제목 + 당월누적/당일 매출·마진 요약, 그 아래 전체 원본 행(맛장군/쿠팡 등
+      결산 제외 사이트도 포함하되 매입가/정산가/마진/마진률은 0으로 채움 — 원본 최종본과 동일).
+    - '최종정산가 및 마진' 시트: 결산 대상 사이트만, '행 레이블/합계 : 정산가/합계 : 마진' + 총합계.
+    - '품목별 판매수량' 시트: 전체 상품(사이트 무관) '행 레이블/합계 : 주문수량' + 총합계.
+    """
     site_summary = P.summarize_by_site(df)
-    product_summary = P.summarize_by_product(df)
+    full_raw = pd.concat([df, excluded]).sort_index()
+
+    sheet_df = full_raw.copy()
+    for col in ["매입가", "정산가", "마진", "마진률"]:
+        if col in sheet_df.columns:
+            sheet_df[col] = sheet_df[col].fillna(0)
+    if "적용규칙" in sheet_df.columns:
+        sheet_df["적용규칙"] = sheet_df["적용규칙"].fillna("결산 대상 아님")
+
+    product_all = (
+        full_raw.groupby("고객선택옵션", dropna=False)["주문수량"].sum()
+        .reset_index()
+        .sort_values("주문수량", ascending=False)
+        .rename(columns={"고객선택옵션": "행 레이블", "주문수량": "합계 : 주문수량"})
+    )
+    product_all = pd.concat([product_all, pd.DataFrame([{
+        "행 레이블": "총합계", "합계 : 주문수량": product_all["합계 : 주문수량"].sum(),
+    }])], ignore_index=True)
+
+    site_tbl = site_summary[["판매사", "정산가", "마진"]].rename(
+        columns={"판매사": "행 레이블", "정산가": "합계 : 정산가", "마진": "합계 : 마진"}
+    )
+    site_tbl = pd.concat([site_tbl, pd.DataFrame([{
+        "행 레이블": "총합계",
+        "합계 : 정산가": site_tbl["합계 : 정산가"].sum(),
+        "합계 : 마진": site_tbl["합계 : 마진"].sum(),
+    }])], ignore_index=True)
+
+    # 당월 누적 = DB에 이미 저장된 이번 달 데이터(오늘 날짜 제외, 중복 방지) + 지금 이 화면의 오늘 데이터
+    db_df = load_all_from_db()
+    month_key = settlement_date.strftime("%Y-%m")
+    date_str = settlement_date.isoformat()
+    if not db_df.empty:
+        prior_mask = (db_df["결산일자"].str.slice(0, 7) == month_key) & (db_df["결산일자"] != date_str)
+        month_prior_rev = db_df.loc[prior_mask, "정산가"].sum()
+        month_prior_margin = db_df.loc[prior_mask, "마진"].sum()
+    else:
+        month_prior_rev = month_prior_margin = 0.0
+    today_rev = float(df["정산가"].sum())
+    today_margin = float(df["마진"].sum())
+    month_rev = month_prior_rev + today_rev
+    month_margin = month_prior_margin + today_margin
 
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-        df.to_excel(writer, sheet_name="결산서", index=False)
-        site_summary.to_excel(writer, sheet_name="최종정산가 및 마진", index=False)
-        product_summary.to_excel(writer, sheet_name="품목별 판매수량", index=False)
+        sheet_df.to_excel(writer, sheet_name="결산서", index=False, startrow=8, startcol=1)
+        ws = writer.sheets["결산서"]
+        ws["B1"] = f"{settlement_date.month:02d}월 {settlement_date.day:02d}일 산지로드 결산서"
+        ws["B1"].font = Font(bold=True, size=14)
+        labels_values = [
+            ("D2", "당월 누적 매출", "F2", month_rev),
+            ("D3", "당월 누적 마진", "F3", month_margin),
+            ("D4", "당일 매출", "F4", today_rev),
+            ("D5", "당일 마진", "F5", today_margin),
+        ]
+        yellow = PatternFill("solid", fgColor="FFFF00")
+        for label_cell, label_text, value_cell, value in labels_values:
+            ws[label_cell] = label_text
+            ws[label_cell].fill = yellow
+            ws[label_cell].font = Font(bold=True)
+            ws[value_cell] = value
+            ws[value_cell].number_format = "#,##0"
+
+        site_tbl.to_excel(writer, sheet_name="최종정산가 및 마진", index=False, startrow=1, startcol=1)
+        product_all.to_excel(writer, sheet_name="품목별 판매수량", index=False, startrow=1, startcol=1)
+
     buf.seek(0)
     return buf.read()
 
@@ -245,7 +311,7 @@ with tab_upload:
     with col_b:
         st.download_button(
             "⬇️ 결산서 최종본 다운로드 (.xlsx)",
-            data=build_output_excel(result.df) if result is not None else b"",
+            data=build_output_excel(result.df, result.excluded, settlement_date) if result is not None else b"",
             file_name=f"{settlement_date.strftime('%m%d')}_산지로드_결산_최종.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             disabled=result is None,
@@ -323,7 +389,7 @@ with tab_upload:
     with col_d:
         st.download_button(
             "⬇️ 결산서 최종본 다운로드 (검토 반영, .xlsx)",
-            data=build_output_excel(working_df) if working_df is not None else b"",
+            data=build_output_excel(working_df, result.excluded, settlement_date) if working_df is not None else b"",
             file_name=f"{settlement_date.strftime('%m%d')}_산지로드_결산_최종_검토반영.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             key="download_reviewed",
