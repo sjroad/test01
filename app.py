@@ -74,6 +74,20 @@ def save_to_db(df: pd.DataFrame, settlement_date: date):
     out.to_sql("records", engine, if_exists="append", index=False)
 
 
+def delete_dates_from_db(date_strs: list[str]) -> int:
+    """지정한 결산일자(들)의 데이터를 통째로 삭제한다. 삭제된 행 수를 반환한다."""
+    if not date_strs:
+        return 0
+    engine = get_engine()
+    ensure_schema(engine)
+    with engine.begin() as conn:
+        total = 0
+        for d in date_strs:
+            result = conn.execute(sa.text('DELETE FROM records WHERE "결산일자" = :d'), {"d": d})
+            total += result.rowcount or 0
+    return total
+
+
 def load_all_from_db() -> pd.DataFrame:
     engine = get_engine()
     ensure_schema(engine)
@@ -726,3 +740,38 @@ with tab_rules:
     if st.button("고정 정산단가 저장", key="save_fp"):
         P.save_fixed_price_table(edited_fp)
         st.success("고정 정산단가 표를 저장했습니다.")
+
+    st.divider()
+    st.subheader("⚠ 저장된 결산일자 삭제")
+    st.caption(
+        "이미 누적 DB에 저장된 날짜의 결산 데이터를 통째로 지웁니다. 원가/수수료 규칙을 "
+        "고쳐서 다시 계산한 뒤 재저장하려면, 먼저 여기서 그 날짜를 지우고 "
+        "'① 결산서 업로드/처리' 탭에서 다시 처리·저장하세요. **삭제하면 복구할 수 없습니다.**"
+    )
+    db_df_for_delete = load_all_from_db()
+    if db_df_for_delete.empty:
+        st.info("저장된 데이터가 없습니다.")
+    else:
+        date_summary = (
+            db_df_for_delete.groupby("결산일자")
+            .agg(건수=("판매사", "count"), 정산가합계=("정산가", "sum"), 마진합계=("마진", "sum"))
+            .reset_index()
+            .sort_values("결산일자", ascending=False)
+        )
+        st.dataframe(date_summary, use_container_width=True, height=200)
+
+        dates_to_delete = st.multiselect(
+            "삭제할 결산일자 선택 (여러 개 가능)",
+            date_summary["결산일자"].tolist(),
+            key="delete_dates_select",
+        )
+        if dates_to_delete:
+            confirm = st.checkbox(
+                f"위에서 고른 {len(dates_to_delete)}개 날짜의 데이터를 정말 삭제합니다 "
+                "(되돌릴 수 없습니다)",
+                key="confirm_delete_dates",
+            )
+            if st.button("🗑 선택한 날짜 삭제", type="primary", disabled=not confirm):
+                deleted = delete_dates_from_db(dates_to_delete)
+                st.success(f"{len(dates_to_delete)}개 날짜, 총 {deleted:,}건을 삭제했습니다.")
+                st.rerun()
