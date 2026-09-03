@@ -1,0 +1,15 @@
+# 누적 데이터 (로컬 SQLite 파일 — 클라우드 배포 시에는 secrets의 DB를 쓰므로 커밋 대상 아님)
+data/settlement.db
+
+# Streamlit 접속정보 (DB 비밀번호 등) — 절대 커밋하면 안 됨
+.streamlit/secrets.toml
+
+# 파이썬 캐시/빌드 산출물
+__pycache__/
+*.pyc
+build/
+dist/
+*.spec
+
+# OS/에디터
+.DS_Store
