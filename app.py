@@ -38,6 +38,7 @@ st.set_page_config(page_title="산지로드 결산 대시보드", layout="wide")
 # ---------------------------------------------------------------------------
 
 @st.cache_resource
+@st.cache_resource
 def get_engine() -> sa.Engine:
     try:
         has_cloud_db = "sql" in st.secrets.get("connections", {})
@@ -46,7 +47,17 @@ def get_engine() -> sa.Engine:
     if has_cloud_db:
         return st.connection("sql", type="sql").engine
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    return sa.create_engine(f"sqlite:///{DB_PATH}")
+    engine = sa.create_engine(
+        f"sqlite:///{DB_PATH}",
+        connect_args={"timeout": 30},
+    )
+    # 여러 담당자가 동시에 접속해도 "database is locked" 오류가 안 나도록,
+    # SQLite를 WAL 모드로 켜고(읽기/쓰기가 서로 덜 막힘) 잠겼을 때 최대 30초까지
+    # 기다렸다가 재시도하도록 설정한다.
+    with engine.begin() as conn:
+        conn.execute(sa.text("PRAGMA journal_mode=WAL"))
+        conn.execute(sa.text("PRAGMA busy_timeout=30000"))
+    return engine
 
 
 def ensure_schema(engine: sa.Engine):
