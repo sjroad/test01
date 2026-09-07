@@ -574,6 +574,14 @@ tab_upload, tab_dashboard, tab_dashboard_monthly, tab_search, tab_rules = st.tab
 with tab_upload:
     st.subheader("1. 취합 결산서 업로드")
     settlement_date = st.date_input("결산 일자", value=date.today())
+
+    _existing_check, _ = load_draft(settlement_date.isoformat())
+    if not _existing_check.empty:
+        st.success(
+            f"✅ **{settlement_date} — 이미 업로드/처리 완료된 날짜입니다.** "
+            "담당자 검토가 진행 중일 수 있으니, 다시 올리기 전에 4번에서 검토 현황을 먼저 확인해 주세요."
+        )
+
     uploaded = st.file_uploader("취합 결산서(xlsx) 파일을 올려주세요", type=["xlsx"])
 
     st.subheader("2. 토스 주문배송관리 파일 업로드")
@@ -729,50 +737,58 @@ with tab_upload:
         )
         working_df, review_excluded = load_draft(review_date_str)
 
-        # 누가 이미 검토를 마쳤는지 상태 표시 — 파일 업로드 칸 자체는 각자 컴퓨터에서만
-        # 보이므로, 이 상태 표시로 다른 담당자의 진행 상황을 확인한다 (DB 기록 기준).
+        # 누가 이미 검토를 마쳤는지 — 업로드 칸 자체는 각자 컴퓨터에서만 보이므로,
+        # 이미 완료한 담당자는 업로드 칸 대신 "업로드완료" 표시만 보여주고, 실수로
+        # 또 올리는 걸 막는다 (정말 다시 올리고 싶으면 아래 체크박스로 열 수 있음).
         review_status = get_review_status(review_date_str)
-        status_cols = st.columns(len(P.REVIEWER_SITE_KEYWORDS))
-        for scol, name in zip(status_cols, P.REVIEWER_SITE_KEYWORDS):
-            with scol:
-                info = review_status.get(name)
-                if info:
-                    st.success(f"✅ {name} 검토완료\n\n{info['시각']} · {info['반영건수']:,}건 반영")
-                else:
-                    st.warning(f"⬜ {name} 아직 검토 전")
-        st.caption(
-            "※ 위 상태는 이 화면을 열었을 때 기준입니다. 다른 담당자가 방금 올렸다면, "
-            "새로고침(F5)하면 최신 상태로 갱신됩니다."
-        )
 
         reviewer_cols = st.columns(len(P.REVIEWER_SITE_KEYWORDS))
         for col, (name, keywords) in zip(reviewer_cols, P.REVIEWER_SITE_KEYWORDS.items()):
             with col:
                 st.markdown(f"**{name}**")
                 st.caption(", ".join(keywords))
-                rfile = st.file_uploader(
-                    f"{name} 검토 파일", type=["xlsx"], key=f"reviewer_{name}_{review_date_str}"
-                )
-                if rfile is not None:
-                    try:
-                        reviewed_raw = P.read_raw_settlement(rfile)
-                    except Exception as e:
-                        st.error(f"파일을 읽는 중 오류가 발생했습니다: {e}")
-                        reviewed_raw = None
-                    if reviewed_raw is not None:
-                        working_df, stats = P.apply_reviewer_corrections(
-                            working_df, reviewed_raw, keywords
-                        )
-                        save_draft(working_df, review_excluded, date.fromisoformat(review_date_str))
-                        log_review(review_date_str, name, stats["changed_rows"])
-                        st.success(
-                            f"담당 {stats['owned_rows']:,}행 중 매입단가 "
-                            f"{stats['changed_rows']:,}건 반영 (저장 완료)"
-                        )
-                        if stats["ignored_rows"] > 0:
-                            st.caption(
-                                f"※ 다른 담당자 사이트 행 {stats['ignored_rows']:,}건은 무시했습니다."
+
+                info = review_status.get(name)
+                show_uploader = True
+                if info:
+                    st.success(
+                        f"✅ **업로드완료**\n\n{info['시각']} · 매입단가 {info['반영건수']:,}건 반영\n\n"
+                        "다른 분은 다시 올리지 않아도 됩니다."
+                    )
+                    show_uploader = st.checkbox(
+                        "그래도 다시 올리기 (내용을 잘못 올렸을 때만)",
+                        key=f"reupload_{name}_{review_date_str}",
+                    )
+
+                if show_uploader:
+                    rfile = st.file_uploader(
+                        f"{name} 검토 파일", type=["xlsx"], key=f"reviewer_{name}_{review_date_str}"
+                    )
+                    if rfile is not None:
+                        try:
+                            reviewed_raw = P.read_raw_settlement(rfile)
+                        except Exception as e:
+                            st.error(f"파일을 읽는 중 오류가 발생했습니다: {e}")
+                            reviewed_raw = None
+                        if reviewed_raw is not None:
+                            working_df, stats = P.apply_reviewer_corrections(
+                                working_df, reviewed_raw, keywords
                             )
+                            save_draft(working_df, review_excluded, date.fromisoformat(review_date_str))
+                            log_review(review_date_str, name, stats["changed_rows"])
+                            st.success(
+                                f"담당 {stats['owned_rows']:,}행 중 매입단가 "
+                                f"{stats['changed_rows']:,}건 반영 (저장 완료)"
+                            )
+                            if stats["ignored_rows"] > 0:
+                                st.caption(
+                                    f"※ 다른 담당자 사이트 행 {stats['ignored_rows']:,}건은 무시했습니다."
+                                )
+
+        st.caption(
+            "※ 위 완료 표시는 이 화면을 열었을 때 기준입니다. 다른 담당자가 방금 올렸다면, "
+            "새로고침(F5)하면 최신 상태로 보입니다."
+        )
 
         unassigned = P.unassigned_sites(working_df) if not working_df.empty else []
         if unassigned:
