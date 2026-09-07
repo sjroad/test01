@@ -11,6 +11,7 @@
 """
 import calendar
 import io
+import time
 from datetime import date
 from pathlib import Path
 
@@ -35,9 +36,28 @@ st.set_page_config(page_title="산지로드 결산 대시보드", layout="wide")
 # secrets에 [connections.sql] url이 설정돼 있으면 그 DB(예: Supabase Postgres)를
 # 쓰고, 없으면(로컬 개발) 지금까지 쓰던 data/settlement.db 파일로 자동 대체한다.
 # 팀 공유용으로 배포할 때는 반드시 secrets에 DB url을 등록해야 데이터가 유지된다.
+#
+# [SQLite 동시접속 안정화]
+# 여러 담당자가 거의 동시에 저장/조회하면 SQLite 파일 하나를 두고 "database is
+# locked" 오류가 날 수 있다. 이를 줄이기 위해 (1) WAL 저널 모드 + busy_timeout을
+# 켜고, (2) 그래도 순간적으로 잠기는 경우를 대비해 쓰기 작업을 짧게 재시도하는
+# _run_with_retry()로 감싼다. 클라우드 DB(secrets 설정)를 쓰는 경우 이 재시도
+# 로직은 그냥 통과되며 별다른 영향이 없다(Postgres 등은 이런 잠금 문제가 없음).
 # ---------------------------------------------------------------------------
 
-@st.cache_resource
+def _run_with_retry(fn, *, attempts: int = 6, base_delay: float = 0.5):
+    """fn()을 실행하다 sqlalchemy.exc.OperationalError가 나면 짧게 대기 후 재시도한다.
+    SQLite의 'database is locked' 류의 일시적 오류에 대응하기 위함이다."""
+    last_err = None
+    for i in range(attempts):
+        try:
+            return fn()
+        except sa.exc.OperationalError as e:
+            last_err = e
+            time.sleep(base_delay * (i + 1))
+    raise last_err
+
+
 @st.cache_resource
 def get_engine() -> sa.Engine:
     try:
@@ -46,83 +66,33 @@ def get_engine() -> sa.Engine:
         has_cloud_db = False  # secrets.toml 자체가 없는 로컬 개발 환경
     if has_cloud_db:
         return st.connection("sql", type="sql").engine
+
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     engine = sa.create_engine(
         f"sqlite:///{DB_PATH}",
         connect_args={"timeout": 30},
     )
-    # 여러 담당자가 동시에 접속해도 "database is locked" 오류가 안 나도록,
-    # SQLite를 WAL 모드로 켜고(읽기/쓰기가 서로 덜 막힘) 잠겼을 때 최대 30초까지
-    # 기다렸다가 재시도하도록 설정한다.
+    # WAL 모드: 읽기와 쓰기가 서로 덜 막히도록 함. busy_timeout: 잠겼을 때 바로
+    # 에러 내지 않고 최대 30초까지 기다렸다가 재시도.
     with engine.begin() as conn:
         conn.execute(sa.text("PRAGMA journal_mode=WAL"))
         conn.execute(sa.text("PRAGMA busy_timeout=30000"))
     return engine
 
 
+_SCHEMA_DONE: set[str] = set()
+
+
 def ensure_schema(engine: sa.Engine):
-    with engine.begin() as conn:
-        conn.execute(sa.text(
-            """
-            CREATE TABLE IF NOT EXISTS records (
-                "결산일자" TEXT, "판매사" TEXT, "고객선택옵션" TEXT, "주문수량" REAL,
-                "공급사배송비" REAL, "결제금액" REAL, "매입단가" REAL, "매입가" REAL,
-                "정산가" REAL, "마진" REAL, "마진률" REAL, "적용규칙" TEXT,
-                "비고" TEXT, "판매사주문번호" TEXT, "수령인연락처" TEXT
-            )
-            """
-        ))
+    key = "records"
+    if key in _SCHEMA_DONE:
+        return
 
-
-def save_to_db(df: pd.DataFrame, settlement_date: date):
-    engine = get_engine()
-    ensure_schema(engine)
-    date_str = settlement_date.isoformat()
-    with engine.begin() as conn:
-        conn.execute(sa.text('DELETE FROM records WHERE "결산일자" = :d'), {"d": date_str})
-    out = df.copy()
-    out.insert(0, "결산일자", date_str)
-    out.to_sql("records", engine, if_exists="append", index=False)
-
-
-def delete_dates_from_db(date_strs: list[str]) -> int:
-    """지정한 결산일자(들)의 데이터를 통째로 삭제한다. 삭제된 행 수를 반환한다."""
-    if not date_strs:
-        return 0
-    engine = get_engine()
-    ensure_schema(engine)
-    with engine.begin() as conn:
-        total = 0
-        for d in date_strs:
-            result = conn.execute(sa.text('DELETE FROM records WHERE "결산일자" = :d'), {"d": d})
-            total += result.rowcount or 0
-    return total
-
-
-def load_all_from_db() -> pd.DataFrame:
-    engine = get_engine()
-    ensure_schema(engine)
-    try:
-        return pd.read_sql("SELECT * FROM records", engine)
-    except Exception:
-        return pd.DataFrame()
-
-
-# ---------------------------------------------------------------------------
-# 담당자 검토용 "임시 저장(초안)"
-#
-# 4번 단계(담당자별 검토)를 세션 상태로만 두면, 담당자마다 각자 컴퓨터에서 따로
-# 접속했을 때 서로의 작업이 보이지 않는다(브라우저 세션이 사람마다 분리되어 있음).
-# 그래서 결산일자를 키로 DB에 "초안"을 저장해두고, 어느 담당자든 접속해서 그 날짜를
-# 고르면 지금까지 반영된 최신 상태를 불러와 자기 몫만 반영한 뒤 바로 다시 저장한다.
-# ---------------------------------------------------------------------------
-
-def ensure_draft_schema(engine: sa.Engine):
-    with engine.begin() as conn:
-        for table in ("drafts", "drafts_excluded"):
+    def _create():
+        with engine.begin() as conn:
             conn.execute(sa.text(
-                f"""
-                CREATE TABLE IF NOT EXISTS {table} (
+                """
+                CREATE TABLE IF NOT EXISTS records (
                     "결산일자" TEXT, "판매사" TEXT, "고객선택옵션" TEXT, "주문수량" REAL,
                     "공급사배송비" REAL, "결제금액" REAL, "매입단가" REAL, "매입가" REAL,
                     "정산가" REAL, "마진" REAL, "마진률" REAL, "적용규칙" TEXT,
@@ -131,32 +101,113 @@ def ensure_draft_schema(engine: sa.Engine):
                 """
             ))
 
+    _run_with_retry(_create)
+    _SCHEMA_DONE.add(key)
+
+
+def save_to_db(df: pd.DataFrame, settlement_date: date):
+    engine = get_engine()
+    ensure_schema(engine)
+    date_str = settlement_date.isoformat()
+
+    def _write():
+        with engine.begin() as conn:
+            conn.execute(sa.text('DELETE FROM records WHERE "결산일자" = :d'), {"d": date_str})
+        out = df.copy()
+        out.insert(0, "결산일자", date_str)
+        out.to_sql("records", engine, if_exists="append", index=False)
+
+    _run_with_retry(_write)
+
+
+def delete_dates_from_db(date_strs: list[str]) -> int:
+    """지정한 결산일자(들)의 데이터를 통째로 삭제한다. 삭제된 행 수를 반환한다."""
+    if not date_strs:
+        return 0
+    engine = get_engine()
+    ensure_schema(engine)
+
+    def _delete():
+        with engine.begin() as conn:
+            total = 0
+            for d in date_strs:
+                result = conn.execute(sa.text('DELETE FROM records WHERE "결산일자" = :d'), {"d": d})
+                total += result.rowcount or 0
+            return total
+
+    return _run_with_retry(_delete)
+
+
+def load_all_from_db() -> pd.DataFrame:
+    engine = get_engine()
+    ensure_schema(engine)
+    try:
+        return _run_with_retry(lambda: pd.read_sql("SELECT * FROM records", engine))
+    except Exception:
+        return pd.DataFrame()
+
+
+# ---------------------------------------------------------------------------
+# 담당자별 검토용 "임시 저장(초안)"
+#
+# 4번 단계(담당자별 검토)를 세션 상태로만 두면, 담당자마다 각자 컴퓨터에서 따로
+# 접속했을 때 서로의 작업이 보이지 않는다(브라우저 세션이 사람마다 분리되어 있음).
+# 그래서 결산일자를 키로 DB에 "초안"을 저장해두고, 어느 담당자든 접속해서 그 날짜를
+# 고르면 지금까지 반영된 최신 상태를 불러와 자기 몫만 반영한 뒤 바로 다시 저장한다.
+# ---------------------------------------------------------------------------
+
+def ensure_draft_schema(engine: sa.Engine):
+    key = "drafts"
+    if key in _SCHEMA_DONE:
+        return
+
+    def _create():
+        with engine.begin() as conn:
+            for table in ("drafts", "drafts_excluded"):
+                conn.execute(sa.text(
+                    f"""
+                    CREATE TABLE IF NOT EXISTS {table} (
+                        "결산일자" TEXT, "판매사" TEXT, "고객선택옵션" TEXT, "주문수량" REAL,
+                        "공급사배송비" REAL, "결제금액" REAL, "매입단가" REAL, "매입가" REAL,
+                        "정산가" REAL, "마진" REAL, "마진률" REAL, "적용규칙" TEXT,
+                        "비고" TEXT, "판매사주문번호" TEXT, "수령인연락처" TEXT
+                    )
+                    """
+                ))
+
+    _run_with_retry(_create)
+    _SCHEMA_DONE.add(key)
+
 
 def save_draft(df: pd.DataFrame, excluded: pd.DataFrame, settlement_date: date):
     engine = get_engine()
     ensure_draft_schema(engine)
     date_str = settlement_date.isoformat()
-    with engine.begin() as conn:
-        conn.execute(sa.text('DELETE FROM drafts WHERE "결산일자" = :d'), {"d": date_str})
-        conn.execute(sa.text('DELETE FROM drafts_excluded WHERE "결산일자" = :d'), {"d": date_str})
-    out = df.copy()
-    out.insert(0, "결산일자", date_str)
-    out.to_sql("drafts", engine, if_exists="append", index=False)
-    out_ex = excluded.copy()
-    out_ex.insert(0, "결산일자", date_str)
-    out_ex.to_sql("drafts_excluded", engine, if_exists="append", index=False)
+
+    def _write():
+        with engine.begin() as conn:
+            conn.execute(sa.text('DELETE FROM drafts WHERE "결산일자" = :d'), {"d": date_str})
+            conn.execute(sa.text('DELETE FROM drafts_excluded WHERE "결산일자" = :d'), {"d": date_str})
+        out = df.copy()
+        out.insert(0, "결산일자", date_str)
+        out.to_sql("drafts", engine, if_exists="append", index=False)
+        out_ex = excluded.copy()
+        out_ex.insert(0, "결산일자", date_str)
+        out_ex.to_sql("drafts_excluded", engine, if_exists="append", index=False)
+
+    _run_with_retry(_write)
 
 
 def load_draft(date_str: str) -> tuple[pd.DataFrame, pd.DataFrame]:
     engine = get_engine()
     ensure_draft_schema(engine)
     try:
-        df = pd.read_sql(
+        df = _run_with_retry(lambda: pd.read_sql(
             sa.text('SELECT * FROM drafts WHERE "결산일자" = :d'), engine, params={"d": date_str}
-        )
-        excluded = pd.read_sql(
+        ))
+        excluded = _run_with_retry(lambda: pd.read_sql(
             sa.text('SELECT * FROM drafts_excluded WHERE "결산일자" = :d'), engine, params={"d": date_str}
-        )
+        ))
     except Exception:
         return pd.DataFrame(), pd.DataFrame()
     for frame in (df, excluded):
@@ -167,9 +218,11 @@ def load_draft(date_str: str) -> tuple[pd.DataFrame, pd.DataFrame]:
 
 def list_draft_dates() -> list[str]:
     engine = get_engine()
-    ensure_draft_schema(engine)
     try:
-        d = pd.read_sql('SELECT DISTINCT "결산일자" FROM drafts ORDER BY "결산일자" DESC', engine)
+        ensure_draft_schema(engine)
+        d = _run_with_retry(lambda: pd.read_sql(
+            'SELECT DISTINCT "결산일자" FROM drafts ORDER BY "결산일자" DESC', engine
+        ))
         return d["결산일자"].tolist()
     except Exception:
         return []
