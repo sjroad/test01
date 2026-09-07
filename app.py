@@ -12,7 +12,7 @@
 import calendar
 import io
 import time
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 
 import pandas as pd
@@ -47,13 +47,26 @@ st.set_page_config(page_title="산지로드 결산 대시보드", layout="wide")
 
 def _run_with_retry(fn, *, attempts: int = 6, base_delay: float = 0.5):
     """fn()을 실행하다 sqlalchemy.exc.OperationalError가 나면 짧게 대기 후 재시도한다.
-    SQLite의 'database is locked' 류의 일시적 오류에 대응하기 위함이다."""
+    SQLite의 'database is locked' 류의 일시적 오류에 대응하기 위함이다.
+
+    단, 비밀번호 오류·인증 실패처럼 재시도해도 절대 성공할 수 없는 '영구적인' 오류는
+    바로 실패시킨다 (괜히 여러 번 재시도하면 Supabase 등에서 "인증 실패가 너무 많다"며
+    일시적으로 접속을 더 오래 차단하는 역효과가 날 수 있다).
+    """
+    PERMANENT_ERROR_HINTS = (
+        "password authentication failed",
+        "does not exist",
+        "permission denied",
+        "circuitbreaker",
+    )
     last_err = None
     for i in range(attempts):
         try:
             return fn()
         except sa.exc.OperationalError as e:
             last_err = e
+            if any(hint in str(e).lower() for hint in PERMANENT_ERROR_HINTS):
+                break
             time.sleep(base_delay * (i + 1))
     raise last_err
 
@@ -226,6 +239,70 @@ def list_draft_dates() -> list[str]:
         return d["결산일자"].tolist()
     except Exception:
         return []
+
+
+# ---------------------------------------------------------------------------
+# 담당자별 "검토 완료 현황" 기록
+#
+# 파일 업로드 버튼(st.file_uploader) 자체는 각자 컴퓨터/브라우저에만 보이는 UI라서,
+# 김슬기가 자기 컴퓨터에서 파일을 올려도 박정배 화면의 업로드 칸에는 그 파일이 "보이지"
+# 않는다 (이건 정상 — 실제 반영된 값은 이미 공용 DB의 drafts 테이블에 저장돼 있다).
+# 다만 "누가 벌써 끝냈는지" 한눈에 알 수 있어야 헷갈리지 않으므로, 별도 로그 테이블에
+# (결산일자, 담당자, 마지막 반영 시각, 반영 건수)를 기록해 화면 상단에 보여준다.
+# ---------------------------------------------------------------------------
+
+def ensure_review_log_schema(engine: sa.Engine):
+    key = "review_log"
+    if key in _SCHEMA_DONE:
+        return
+
+    def _create():
+        with engine.begin() as conn:
+            conn.execute(sa.text(
+                """
+                CREATE TABLE IF NOT EXISTS review_log (
+                    "결산일자" TEXT, "담당자" TEXT, "반영건수" INTEGER, "시각" TEXT
+                )
+                """
+            ))
+
+    _run_with_retry(_create)
+    _SCHEMA_DONE.add(key)
+
+
+def log_review(date_str: str, reviewer: str, changed_count: int):
+    engine = get_engine()
+    ensure_review_log_schema(engine)
+
+    def _write():
+        with engine.begin() as conn:
+            conn.execute(
+                sa.text('DELETE FROM review_log WHERE "결산일자" = :d AND "담당자" = :r'),
+                {"d": date_str, "r": reviewer},
+            )
+            conn.execute(
+                sa.text(
+                    'INSERT INTO review_log ("결산일자","담당자","반영건수","시각") '
+                    "VALUES (:d, :r, :c, :t)"
+                ),
+                {"d": date_str, "r": reviewer, "c": changed_count, "t": datetime.now().isoformat(timespec="seconds")},
+            )
+
+    _run_with_retry(_write)
+
+
+def get_review_status(date_str: str) -> dict[str, dict]:
+    """{담당자명: {"반영건수": int, "시각": str}} 형태로 반환. 아직 안 한 담당자는 키가 없음."""
+    engine = get_engine()
+    try:
+        ensure_review_log_schema(engine)
+        df = _run_with_retry(lambda: pd.read_sql(
+            sa.text('SELECT "담당자","반영건수","시각" FROM review_log WHERE "결산일자" = :d'),
+            engine, params={"d": date_str},
+        ))
+    except Exception:
+        return {}
+    return {row["담당자"]: {"반영건수": row["반영건수"], "시각": row["시각"]} for _, row in df.iterrows()}
 
 
 # ---------------------------------------------------------------------------
@@ -652,6 +729,22 @@ with tab_upload:
         )
         working_df, review_excluded = load_draft(review_date_str)
 
+        # 누가 이미 검토를 마쳤는지 상태 표시 — 파일 업로드 칸 자체는 각자 컴퓨터에서만
+        # 보이므로, 이 상태 표시로 다른 담당자의 진행 상황을 확인한다 (DB 기록 기준).
+        review_status = get_review_status(review_date_str)
+        status_cols = st.columns(len(P.REVIEWER_SITE_KEYWORDS))
+        for scol, name in zip(status_cols, P.REVIEWER_SITE_KEYWORDS):
+            with scol:
+                info = review_status.get(name)
+                if info:
+                    st.success(f"✅ {name} 검토완료\n\n{info['시각']} · {info['반영건수']:,}건 반영")
+                else:
+                    st.warning(f"⬜ {name} 아직 검토 전")
+        st.caption(
+            "※ 위 상태는 이 화면을 열었을 때 기준입니다. 다른 담당자가 방금 올렸다면, "
+            "새로고침(F5)하면 최신 상태로 갱신됩니다."
+        )
+
         reviewer_cols = st.columns(len(P.REVIEWER_SITE_KEYWORDS))
         for col, (name, keywords) in zip(reviewer_cols, P.REVIEWER_SITE_KEYWORDS.items()):
             with col:
@@ -671,6 +764,7 @@ with tab_upload:
                             working_df, reviewed_raw, keywords
                         )
                         save_draft(working_df, review_excluded, date.fromisoformat(review_date_str))
+                        log_review(review_date_str, name, stats["changed_rows"])
                         st.success(
                             f"담당 {stats['owned_rows']:,}행 중 매입단가 "
                             f"{stats['changed_rows']:,}건 반영 (저장 완료)"
