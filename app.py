@@ -229,6 +229,77 @@ def load_draft(date_str: str) -> tuple[pd.DataFrame, pd.DataFrame]:
     return df, excluded
 
 
+def apply_reviewer_corrections_to_db(
+    review_date_str: str, reviewed_raw: pd.DataFrame, keywords: list[str],
+) -> dict:
+    """담당자가 검토한 파일에서 자기 담당 사이트의 매입단가만 뽑아, DB에서 그 행들만
+    콕 집어 UPDATE 한다 (초안 전체를 읽어서 통째로 다시 쓰지 않는다).
+
+    이렇게 해야 여러 담당자가 거의 동시에 저장해도 서로 다른 사이트의 행을 건드리기
+    때문에 충돌 없이 안전하다 — '전체 읽기 → 메모리에서 수정 → 전체 다시 쓰기' 방식은
+    두 사람이 동시에 저장하면 늦게 저장한 쪽이 먼저 저장한 사람의 변경을 지워버릴 수 있다.
+    """
+    engine = get_engine()
+    ensure_draft_schema(engine)
+
+    def is_owned(site) -> bool:
+        return any(kw.lower() in str(site).lower() for kw in keywords)
+
+    owned_reviewed = reviewed_raw[reviewed_raw["판매사"].apply(is_owned)]
+    ignored_rows = len(reviewed_raw) - len(owned_reviewed)
+    changed = 0
+
+    def _write():
+        nonlocal changed
+        with engine.begin() as conn:
+            for _, row in owned_reviewed.iterrows():
+                new_cost = row.get("매입단가")
+                if pd.isna(new_cost):
+                    continue
+                site = row["판매사"]
+                product = row["고객선택옵션"]
+                order_no = row.get("판매사주문번호")
+                order_no = "" if pd.isna(order_no) else str(order_no).strip()
+
+                sel = conn.execute(
+                    sa.text(
+                        'SELECT "매입단가", "정산가", "주문수량", "공급사배송비" FROM drafts '
+                        'WHERE "결산일자"=:d AND "판매사"=:s AND "고객선택옵션"=:p '
+                        'AND COALESCE("판매사주문번호",\'\')=:o'
+                    ),
+                    {"d": review_date_str, "s": site, "p": product, "o": order_no},
+                ).fetchone()
+                if sel is None:
+                    continue
+                old_cost, settle, qty, ship = sel
+                if old_cost is not None and float(old_cost) == float(new_cost):
+                    continue
+
+                new_buy = float(new_cost) * (qty or 0) + (ship or 0)
+                new_margin = (settle - new_buy) if settle is not None else None
+                new_rate = (new_margin / settle) if settle else None
+
+                conn.execute(
+                    sa.text(
+                        'UPDATE drafts SET "매입단가"=:c, "매입가"=:b, "마진"=:m, "마진률"=:r '
+                        'WHERE "결산일자"=:d AND "판매사"=:s AND "고객선택옵션"=:p '
+                        'AND COALESCE("판매사주문번호",\'\')=:o'
+                    ),
+                    {
+                        "c": float(new_cost), "b": new_buy, "m": new_margin, "r": new_rate,
+                        "d": review_date_str, "s": site, "p": product, "o": order_no,
+                    },
+                )
+                changed += 1
+
+    _run_with_retry(_write)
+    return {
+        "owned_rows": int(len(owned_reviewed)),
+        "changed_rows": changed,
+        "ignored_rows": int(ignored_rows),
+    }
+
+
 def list_draft_dates() -> list[str]:
     engine = get_engine()
     try:
@@ -771,11 +842,13 @@ with tab_upload:
                             st.error(f"파일을 읽는 중 오류가 발생했습니다: {e}")
                             reviewed_raw = None
                         if reviewed_raw is not None:
-                            working_df, stats = P.apply_reviewer_corrections(
-                                working_df, reviewed_raw, keywords
-                            )
-                            save_draft(working_df, review_excluded, date.fromisoformat(review_date_str))
+                            # 초안 전체를 읽어서 통째로 다시 쓰지 않고, 이 담당자의 사이트
+                            # 행만 DB에서 직접 골라 업데이트한다 — 다른 담당자가 거의 동시에
+                            # 저장해도 서로의 변경을 지우지 않도록 하기 위함.
+                            stats = apply_reviewer_corrections_to_db(review_date_str, reviewed_raw, keywords)
                             log_review(review_date_str, name, stats["changed_rows"])
+                            # 화면에 보여줄 최신 상태를 다시 불러옴 (방금 반영한 내용 포함)
+                            working_df, review_excluded = load_draft(review_date_str)
                             st.success(
                                 f"담당 {stats['owned_rows']:,}행 중 매입단가 "
                                 f"{stats['changed_rows']:,}건 반영 (저장 완료)"
