@@ -46,7 +46,10 @@ DEFAULT_CASHDEAL_EXCEPTIONS = [
 FIXED_PRICE_SITE_KEYWORDS = ["케이딜", "꿈꾸는이웃", "홈앤쇼핑", "LG 복지몰", "제트언스"]
 
 TOSS_KEYWORD = "토스"
-TOSS_INCENTIVE_TEXT = "수수료 0원 적용"
+# 토스 '주문배송관리' 파일의 '받은 혜택' 열에는 실제로 다음과 같은 값들이 들어온다
+# (2026-09 확인): '' (혜택 없음), '수수료 0% (배송 인센티브)', '수수료 0% (상품 광고)'.
+# 사유는 다르지만 둘 다 "수수료 0%" 혜택이므로, 이 공통 문구로 매칭한다.
+TOSS_INCENTIVE_TEXT = "수수료 0%"
 TOSS_INCENTIVE_RATE = 1 - 0.033
 TOSS_DEFAULT_RATE = 1 - 0.11
 
