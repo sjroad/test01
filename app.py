@@ -41,8 +41,7 @@ st.set_page_config(page_title="산지로드 결산 대시보드", layout="wide")
 # 여러 담당자가 거의 동시에 저장/조회하면 SQLite 파일 하나를 두고 "database is
 # locked" 오류가 날 수 있다. 이를 줄이기 위해 (1) WAL 저널 모드 + busy_timeout을
 # 켜고, (2) 그래도 순간적으로 잠기는 경우를 대비해 쓰기 작업을 짧게 재시도하는
-# _run_with_retry()로 감싼다. 클라우드 DB(secrets 설정)를 쓰는 경우 이 재시도
-# 로직은 그냥 통과되며 별다른 영향이 없다(Postgres 등은 이런 잠금 문제가 없음).
+# _run_with_retry()로 감싼다.
 # ---------------------------------------------------------------------------
 
 def _run_with_retry(fn, *, attempts: int = 6, base_delay: float = 0.5):
@@ -406,7 +405,7 @@ def _month_weekdays(year: int, month: int) -> list[date]:
 def _style_pivot_sheet(ws, n_data_rows: int, money_cols: list[str]):
     """'행 레이블 / 합계 : ...' 형태 시트 공통 서식(헤더·총합계 노란색, 테두리, 회계서식)."""
     header_row = 2
-    last_row = header_row + n_data_rows  # 총합계 포함된 마지막 데이터 행
+    last_row = header_row + n_data_rows
     for col in ["B"] + money_cols:
         c = ws[f"{col}{header_row}"]
         c.fill = YELLOW_FILL
@@ -419,7 +418,7 @@ def _style_pivot_sheet(ws, n_data_rows: int, money_cols: list[str]):
             c.border = THIN_BORDER
             if col in money_cols:
                 c.number_format = ACCOUNTING_FMT
-        if r == last_row:  # 총합계 행
+        if r == last_row:
             for col in ["B"] + money_cols:
                 ws[f"{col}{r}"].fill = YELLOW_FILL
 
@@ -459,7 +458,6 @@ def build_output_excel(df: pd.DataFrame, excluded: pd.DataFrame, settlement_date
         "합계 : 마진": site_tbl["합계 : 마진"].sum(),
     }])], ignore_index=True)
 
-    # 당월 누적 = DB에 이미 저장된 이번 달 데이터(오늘 날짜 제외, 중복 방지) + 지금 이 화면의 오늘 데이터
     db_df = load_all_from_db()
     month_key = settlement_date.strftime("%Y-%m")
     date_str = settlement_date.isoformat()
@@ -486,7 +484,6 @@ def build_output_excel(df: pd.DataFrame, excluded: pd.DataFrame, settlement_date
 
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-        # ---------------- 결산서 ----------------
         sheet_df.to_excel(writer, sheet_name="결산서", index=False, startrow=8, startcol=1)
         ws = writer.sheets["결산서"]
         last_row = 9 + len(sheet_df)
@@ -538,7 +535,6 @@ def build_output_excel(df: pd.DataFrame, excluded: pd.DataFrame, settlement_date
             vc.border = THIN_BORDER
             vc.alignment = CENTER
 
-        # 날짜 트래커 (평일 12개씩 두 줄 — 원본의 P~AA 12칸 구성과 동일한 폭)
         weekdays = _month_weekdays(settlement_date.year, settlement_date.month)
         batch1, batch2 = weekdays[:12], weekdays[12:24]
         ws["O3"] = "당일매출"; ws["O3"].font = BODY_FONT
@@ -547,7 +543,7 @@ def build_output_excel(df: pd.DataFrame, excluded: pd.DataFrame, settlement_date
         ws["O7"] = "당일마진"; ws["O7"].font = BODY_FONT
         for batch, date_row, rev_row, margin_row in [(batch1, 2, 3, 4), (batch2, 5, 6, 7)]:
             for i, d in enumerate(batch):
-                col = get_column_letter(16 + i)  # P부터
+                col = get_column_letter(16 + i)
                 dcell = ws[f"{col}{date_row}"]
                 dcell.value = d
                 dcell.number_format = DATE_HDR_FMT
@@ -574,7 +570,6 @@ def build_output_excel(df: pd.DataFrame, excluded: pd.DataFrame, settlement_date
                 ws[f"{col}{r}"].number_format = ACCOUNTING_FMT
             ws[f"K{r}"].number_format = "0%"
 
-        # ---------------- 최종정산가 및 마진 ----------------
         site_tbl.to_excel(writer, sheet_name="최종정산가 및 마진", index=False, startrow=1, startcol=1)
         ws2 = writer.sheets["최종정산가 및 마진"]
         ws2.column_dimensions["B"].width = 30.57
@@ -582,7 +577,6 @@ def build_output_excel(df: pd.DataFrame, excluded: pd.DataFrame, settlement_date
         ws2.column_dimensions["D"].width = 14.29
         _style_pivot_sheet(ws2, len(site_tbl), ["C", "D"])
 
-        # ---------------- 품목별 판매수량 ----------------
         product_all.to_excel(writer, sheet_name="품목별 판매수량", index=False, startrow=1, startcol=1)
         ws3 = writer.sheets["품목별 판매수량"]
         ws3.column_dimensions["B"].width = 70.29
@@ -594,7 +588,6 @@ def build_output_excel(df: pd.DataFrame, excluded: pd.DataFrame, settlement_date
 
 
 def styled_site_table(site_summary: pd.DataFrame):
-    """엑셀 피벗테이블 느낌(행 레이블 / 합계:정산가 / 합계:마진, 총합계 노란 강조)의 표."""
     tbl = site_summary[["판매사", "정산가", "마진"]].rename(
         columns={"판매사": "행 레이블", "정산가": "합계 : 정산가", "마진": "합계 : 마진"}
     )
@@ -618,7 +611,6 @@ def styled_site_table(site_summary: pd.DataFrame):
 
 
 def kpi_box_html(rows: list[tuple[str, str]]) -> str:
-    """이미지2의 노란색 라벨/값 박스 스타일 요약표."""
     trs = "".join(
         f'<tr><td style="background:#FFFF00;border:1px solid #999;padding:6px 14px;'
         f'font-weight:700;width:160px">{label}</td>'
@@ -627,6 +619,54 @@ def kpi_box_html(rows: list[tuple[str, str]]) -> str:
         for label, value in rows
     )
     return f'<table style="border-collapse:collapse;font-size:15px">{trs}</table>'
+
+
+# ---------------------------------------------------------------------------
+# 처리 결과 요약 렌더링 (공용 함수)
+#
+# 아래 두 상황 모두에서 "똑같은 화면"을 보여주기 위해 함수로 뺐다:
+#   (1) 방금 이 세션에서 취합 결산서를 올려 새로 계산한 직후
+#   (2) 다른 컴퓨터/세션에서 이미 처리해 DB에 저장해둔 날짜를, 파일 업로드 없이
+#       선택만 했을 때 (예전엔 이 경우 빈 화면만 보이는 문제가 있었음)
+# ---------------------------------------------------------------------------
+
+def render_result_summary(result: "P.ProcessResult"):
+    n_total = len(result.df)
+    n_ok = n_total - len(result.needs_review)
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("전체 행", f"{n_total:,}")
+    c2.metric("정산가 계산 완료", f"{n_ok:,}")
+    c3.metric("확인 필요", f"{len(result.needs_review):,}")
+    c4.metric("결산 제외", f"{len(result.excluded):,}")
+
+    if len(result.excluded) > 0:
+        with st.expander(
+            f"결산 대상 18개 사이트에 없어 제외한 행 {len(result.excluded):,}건 "
+            "(맛장군/쿠팡 등)"
+        ):
+            st.dataframe(
+                result.excluded[["판매사", "고객선택옵션", "결제금액", "주문수량"]]
+                .groupby("판매사", as_index=False)
+                .agg(건수=("결제금액", "count"), 결제금액합계=("결제금액", "sum"))
+                .sort_values("결제금액합계", ascending=False),
+                use_container_width=True,
+            )
+
+    if len(result.needs_review) > 0:
+        st.warning(
+            "아래 사이트/상품은 정산 규칙이 없어 정산가를 계산하지 못했습니다. "
+            "'규칙 관리' 탭에서 요율 또는 고정 정산단가를 등록한 뒤 다시 처리해 주세요."
+        )
+        st.dataframe(
+            result.needs_review[["판매사", "고객선택옵션", "결제금액", "주문수량"]]
+            .groupby(["판매사", "고객선택옵션"], as_index=False)
+            .agg(건수=("결제금액", "count"), 결제금액합계=("결제금액", "sum")),
+            use_container_width=True,
+        )
+
+    st.caption("계산 결과")
+    st.dataframe(result.df, use_container_width=True, height=350)
 
 
 # ---------------------------------------------------------------------------
@@ -646,8 +686,8 @@ with tab_upload:
     st.subheader("1. 취합 결산서 업로드")
     settlement_date = st.date_input("결산 일자", value=date.today())
 
-    _existing_check, _ = load_draft(settlement_date.isoformat())
-    if not _existing_check.empty:
+    _existing_df, _existing_excluded = load_draft(settlement_date.isoformat())
+    if not _existing_df.empty:
         st.success(
             f"✅ **{settlement_date} — 이미 업로드/처리 완료된 날짜입니다.** "
             "담당자 검토가 진행 중일 수 있으니, 다시 올리기 전에 4번에서 검토 현황을 먼저 확인해 주세요."
@@ -697,42 +737,8 @@ with tab_upload:
                         "'확인 필요' 목록에 포함됩니다 — 결산 대상 주문이 모두 담긴 배송관리 "
                         "파일인지 확인해 주세요)."
                     )
-            n_total = len(result.df)
-            n_ok = n_total - len(result.needs_review)
 
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("전체 행", f"{n_total:,}")
-            c2.metric("정산가 계산 완료", f"{n_ok:,}")
-            c3.metric("확인 필요", f"{len(result.needs_review):,}")
-            c4.metric("결산 제외", f"{len(result.excluded):,}")
-
-            if len(result.excluded) > 0:
-                with st.expander(
-                    f"결산 대상 18개 사이트에 없어 제외한 행 {len(result.excluded):,}건 "
-                    "(맛장군/쿠팡 등)"
-                ):
-                    st.dataframe(
-                        result.excluded[["판매사", "고객선택옵션", "결제금액", "주문수량"]]
-                        .groupby("판매사", as_index=False)
-                        .agg(건수=("결제금액", "count"), 결제금액합계=("결제금액", "sum"))
-                        .sort_values("결제금액합계", ascending=False),
-                        use_container_width=True,
-                    )
-
-            if len(result.needs_review) > 0:
-                st.warning(
-                    "아래 사이트/상품은 정산 규칙이 없어 정산가를 계산하지 못했습니다. "
-                    "'규칙 관리' 탭에서 요율 또는 고정 정산단가를 등록한 뒤 다시 처리해 주세요."
-                )
-                st.dataframe(
-                    result.needs_review[["판매사", "고객선택옵션", "결제금액", "주문수량"]]
-                    .groupby(["판매사", "고객선택옵션"], as_index=False)
-                    .agg(건수=("결제금액", "count"), 결제금액합계=("결제금액", "sum")),
-                    use_container_width=True,
-                )
-
-            st.caption("계산 결과")
-            st.dataframe(result.df, use_container_width=True, height=350)
+            render_result_summary(result)
 
             # 이 날짜의 검토용 데이터(초안)를 DB에 저장 — 담당자들이 각자 다른 시간/컴퓨터에서
             # 접속해 4번 단계를 이어받을 수 있도록 함. 이미 진행 중인 초안이 있으면 담당자 검토
@@ -757,9 +763,16 @@ with tab_upload:
                     st.success("초기화했습니다.")
                     st.rerun()
 
+    elif not _existing_df.empty:
+        # 이번 세션에서는 파일을 새로 안 올렸지만, 이미 저장된 날짜라면 그 저장된 내용을
+        # 그대로 불러와 같은 화면을 보여준다 (다른 컴퓨터에서 올린 내용도 여기서 바로 보임).
+        st.caption("📦 이미 저장된 데이터를 불러와 보여드립니다 (다른 컴퓨터에서 올린 내용 포함).")
+        _needs_review = _existing_df[_existing_df["정산가"].isna()]
+        result = P.ProcessResult(df=_existing_df, needs_review=_needs_review, excluded=_existing_excluded)
+        render_result_summary(result)
+
     # -----------------------------------------------------------------
-    # 3. 결산서 최종본 다운로드 — 1번 업로드 전에도 버튼은 항상 보이되,
-    #    데이터가 없으면 비활성화 상태로 둔다.
+    # 3. 결산서 최종본 다운로드
     # -----------------------------------------------------------------
     st.subheader("3. 결산서 최종본 다운로드")
     col_a, col_b = st.columns(2)
@@ -781,8 +794,6 @@ with tab_upload:
 
     # -----------------------------------------------------------------
     # 4. 담당자별 수정/검토 파일 업로드
-    #    — 브라우저 세션이 아니라 DB에 결산일자별 "초안"을 저장해두는 방식이라,
-    #      담당자마다 각자 다른 시간·다른 컴퓨터에서 접속해 올려도 된다.
     # -----------------------------------------------------------------
     st.subheader("4. 담당자별 수정/검토 파일 업로드")
     st.caption(
@@ -842,12 +853,8 @@ with tab_upload:
                             st.error(f"파일을 읽는 중 오류가 발생했습니다: {e}")
                             reviewed_raw = None
                         if reviewed_raw is not None:
-                            # 초안 전체를 읽어서 통째로 다시 쓰지 않고, 이 담당자의 사이트
-                            # 행만 DB에서 직접 골라 업데이트한다 — 다른 담당자가 거의 동시에
-                            # 저장해도 서로의 변경을 지우지 않도록 하기 위함.
                             stats = apply_reviewer_corrections_to_db(review_date_str, reviewed_raw, keywords)
                             log_review(review_date_str, name, stats["changed_rows"])
-                            # 화면에 보여줄 최신 상태를 다시 불러옴 (방금 반영한 내용 포함)
                             working_df, review_excluded = load_draft(review_date_str)
                             st.success(
                                 f"담당 {stats['owned_rows']:,}행 중 매입단가 "
