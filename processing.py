@@ -46,12 +46,15 @@ DEFAULT_CASHDEAL_EXCEPTIONS = [
 FIXED_PRICE_SITE_KEYWORDS = ["케이딜", "꿈꾸는이웃", "홈앤쇼핑", "LG 복지몰", "제트언스"]
 
 TOSS_KEYWORD = "토스"
-# 토스 '주문배송관리' 파일의 '받은 혜택' 열에는 실제로 다음과 같은 값들이 들어온다
-# (2026-09 확인): '' (혜택 없음), '수수료 0% (배송 인센티브)', '수수료 0% (상품 광고)'.
-# 사유는 다르지만 둘 다 "수수료 0%" 혜택이므로, 이 공통 문구로 매칭한다.
-TOSS_INCENTIVE_TEXT = "수수료 0%"
-TOSS_INCENTIVE_RATE = 1 - 0.033
-TOSS_DEFAULT_RATE = 1 - 0.11
+# 토스 '주문배송관리' 파일의 '받은 혜택' 열(F열) 기준, 2026-09 정책 변경 이후 3가지 경우:
+#   1) "수수료 6% (배송 인센티브)" -> 배송비 6% + 기본수수료 3.3% = 총 9.3%
+#   2) "수수료 0% (상품 광고)"     -> 광고 참여로 배송비 0%, 기본수수료 3.3%만 부과
+#   3) 공란(혜택 없음)             -> 기본수수료 11%
+TOSS_SHIPPING_INCENTIVE_TEXT = "수수료 6%"   # 배송 인센티브 (6%+3.3%=9.3%)
+TOSS_AD_INCENTIVE_TEXT = "수수료 0%"          # 상품 광고 (3.3%만)
+TOSS_SHIPPING_INCENTIVE_RATE = 1 - 0.093      # 0.907
+TOSS_AD_INCENTIVE_RATE = 1 - 0.033            # 0.967
+TOSS_DEFAULT_RATE = 1 - 0.11                  # 0.89 (공란)
 
 SETTLEMENT_SITES = [
     "꿈꾸는이웃(산지로드)", "더로드 네이버 스마트스토어", "더로드 자사몰",
@@ -172,8 +175,9 @@ def _normalize_order_no(value) -> str:
 def read_toss_delivery_file(file) -> dict[str, float]:
     """토스 '주문배송관리' 엑셀(주문내역 시트)에서 주문번호별 실제 수수료율을 읽어온다.
 
-    F열 '받은 혜택'에 "수수료 0원 적용" 문구가 있으면 수수료 3.3%(요율 0.967),
-    빈칸이면 수수료 11%(요율 0.89)가 적용된다. 반환값은 {주문번호(str): 요율} 딕셔너리로,
+    F열 '받은 혜택'에 "수수료 6%"가 포함되면 배송 인센티브(6%+기본 3.3%=9.3%, 요율 0.907),
+    "수수료 0%"가 포함되면 상품 광고(기본 3.3%만, 요율 0.967), 공란이면 기본 수수료
+    11%(요율 0.89)가 적용된다. 반환값은 {주문번호(str): 요율} 딕셔너리로,
     process_settlement(..., toss_delivery_rates=...)에 그대로 넘기면 된다.
     """
     df_full = pd.read_excel(file, sheet_name=0, header=None)
@@ -206,7 +210,12 @@ def read_toss_delivery_file(file) -> dict[str, float]:
             continue
         benefit = row[col_benefit]
         benefit = "" if pd.isna(benefit) else str(benefit)
-        rate = TOSS_INCENTIVE_RATE if TOSS_INCENTIVE_TEXT in benefit else TOSS_DEFAULT_RATE
+        if TOSS_SHIPPING_INCENTIVE_TEXT in benefit:
+            rate = TOSS_SHIPPING_INCENTIVE_RATE
+        elif TOSS_AD_INCENTIVE_TEXT in benefit:
+            rate = TOSS_AD_INCENTIVE_RATE
+        else:
+            rate = TOSS_DEFAULT_RATE
         rates[order_no] = rate
     return rates
 
