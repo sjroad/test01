@@ -27,6 +27,7 @@ DEFAULT_RATE_RULES = [
     {"keyword": "자사몰", "type": "percent", "rate": 0.96, "note": ""},
     {"keyword": "네이버 스마트스토어", "type": "percent", "rate": 0.90, "note": ""},
     {"keyword": "티딜", "type": "percent", "rate": 0.85, "note": ""},
+    {"keyword": "홈앤쇼핑", "type": "percent", "rate": 0.68, "note": "수수료 32%"},
     {"keyword": "토스", "type": "percent", "rate": 0.967,
      "note": "주문배송관리 파일 미제공 시 fallback 요율."},
     {"keyword": "지마켓", "type": "same_as_payment", "rate": 1.0, "note": ""},
@@ -43,7 +44,7 @@ DEFAULT_CASHDEAL_EXCEPTIONS = [
     {"상품명": "홍주부아카시아향사양꿀2.4kg", "rate": 0.80},
 ]
 
-FIXED_PRICE_SITE_KEYWORDS = ["케이딜", "꿈꾸는이웃", "홈앤쇼핑", "LG 복지몰", "제트언스"]
+FIXED_PRICE_SITE_KEYWORDS = ["케이딜", "꿈꾸는이웃", "LG 복지몰", "제트언스"]
 
 TOSS_KEYWORD = "토스"
 # 토스 '주문배송관리' 파일의 '받은 혜택' 열(F열) 기준, 2026-09 정책 변경 이후 3가지 경우:
