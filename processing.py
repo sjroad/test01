@@ -102,8 +102,15 @@ def save_cashdeal_exceptions(rows: list[dict]) -> None:
 
 def load_fixed_price_table() -> pd.DataFrame:
     if FIXED_PRICE_PATH.exists():
-        return pd.read_csv(FIXED_PRICE_PATH, encoding="utf-8-sig")
-    return pd.DataFrame(columns=["판매사", "상품명", "정산단가(개당)"])
+        df = pd.read_csv(FIXED_PRICE_PATH, encoding="utf-8-sig")
+    else:
+        df = pd.DataFrame(columns=["판매사", "상품명", "정산단가(개당)"])
+    # 홈앤쇼핑은 더 이상 '고정 정산단가' 방식이 아니라 32% 정률 방식으로 바뀌었으므로,
+    # 예전에 등록해둔 홈앤쇼핑 행이 데이터 파일에 남아있어도(빈 행 포함) 항상 걸러내
+    # 계산에 전혀 영향을 주지 않도록 한다.
+    if "판매사" in df.columns and len(df) > 0:
+        df = df[~df["판매사"].astype(str).str.contains("홈앤쇼핑", na=False)].reset_index(drop=True)
+    return df
 
 
 def save_fixed_price_table(df: pd.DataFrame) -> None:
