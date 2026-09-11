@@ -928,7 +928,15 @@ with tab_dashboard:
         product_summary = P.summarize_by_product(view_df)
 
         st.markdown("**사이트별 정산가 · 마진 합계**")
-        st.dataframe(styled_site_table(site_summary), use_container_width=True, hide_index=True)
+        # 행 수에 맞춰 높이를 계산해서, 내부 스크롤 없이 전체가 한 번에 보이도록 함
+        # (기본값으로 두면 Streamlit이 고정 높이+스크롤로 표시해 아래쪽 사이트가 가려짐)
+        _table_height = 38 + 35 * (len(site_summary) + 1)  # 헤더 + (사이트 수 + 총합계행) * 행높이
+        st.dataframe(
+            styled_site_table(site_summary),
+            use_container_width=True,
+            hide_index=True,
+            height=_table_height,
+        )
 
         col1, col2 = st.columns(2)
         with col1:
