@@ -607,6 +607,14 @@ def styled_site_table(site_summary: pd.DataFrame):
         tbl.style.apply(highlight_total, axis=1)
         .format({"합계 : 정산가": "{:,.0f}", "합계 : 마진": "{:,.0f}"})
         .hide(axis="index")
+        .set_table_attributes('style="width:100%; border-collapse:collapse;"')
+        .set_table_styles([
+            {"selector": "th", "props": [("text-align", "center"), ("padding", "6px 10px"),
+                                          ("background-color", "#f0f2f6"), ("color", "#5c5c5c"),
+                                          ("font-weight", "500"), ("border", "1px solid #e6e6e6")]},
+            {"selector": "td", "props": [("text-align", "center"), ("padding", "5px 10px"),
+                                          ("border", "1px solid #e6e6e6")]},
+        ])
     )
 
 
@@ -928,15 +936,10 @@ with tab_dashboard:
         product_summary = P.summarize_by_product(view_df)
 
         st.markdown("**사이트별 정산가 · 마진 합계**")
-        # 행 수에 맞춰 높이를 계산해서, 내부 스크롤 없이 전체가 한 번에 보이도록 함
-        # (기본값으로 두면 Streamlit이 고정 높이+스크롤로 표시해 아래쪽 사이트가 가려짐)
-        _table_height = 38 + 35 * (len(site_summary) + 1)  # 헤더 + (사이트 수 + 총합계행) * 행높이
-        st.dataframe(
-            styled_site_table(site_summary),
-            use_container_width=True,
-            hide_index=True,
-            height=_table_height,
-        )
+        # st.dataframe(내부 그리드)는 글자 정렬/너비를 세밀하게 제어하기 어려워서,
+        # 승인받은 디자인(전체 폭, 모든 셀 가운데 정렬, 스크롤 없음)대로 보이도록
+        # HTML 표로 직접 렌더링한다.
+        st.markdown(styled_site_table(site_summary).to_html(), unsafe_allow_html=True)
 
         col1, col2 = st.columns(2)
         with col1:
@@ -945,6 +948,7 @@ with tab_dashboard:
                 names="판매사", values="정산가",
                 title="사이트별 정산가 비중",
             )
+            fig1.update_layout(height=550)
             st.plotly_chart(fig1, use_container_width=True)
 
         with col2:
@@ -953,6 +957,7 @@ with tab_dashboard:
                 names="판매사", values="마진",
                 title="사이트별 마진 비중",
             )
+            fig2.update_layout(height=550)
             st.plotly_chart(fig2, use_container_width=True)
 
         top10 = product_summary.head(10).copy()
