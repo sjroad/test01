@@ -228,74 +228,62 @@ def load_draft(date_str: str) -> tuple[pd.DataFrame, pd.DataFrame]:
     return df, excluded
 
 
-def apply_reviewer_corrections_to_db(
+def apply_reviewer_file_to_db(
     review_date_str: str, reviewed_raw: pd.DataFrame, keywords: list[str],
 ) -> dict:
-    """담당자가 검토한 파일에서 자기 담당 사이트의 매입단가만 뽑아, DB에서 그 행들만
-    콕 집어 UPDATE 한다 (초안 전체를 읽어서 통째로 다시 쓰지 않는다).
+    """담당자가 올린 검토 파일에서 자기 담당 사이트 행을 통째로 뽑아, 처음부터 다시
+    계산(process_settlement)한 뒤, 기존 초안(DB)의 그 사이트 행들을 전부 삭제하고
+    새로 계산한 값으로 바꿔치기한다.
 
-    이렇게 해야 여러 담당자가 거의 동시에 저장해도 서로 다른 사이트의 행을 건드리기
-    때문에 충돌 없이 안전하다 — '전체 읽기 → 메모리에서 수정 → 전체 다시 쓰기' 방식은
-    두 사람이 동시에 저장하면 늦게 저장한 쪽이 먼저 저장한 사람의 변경을 지워버릴 수 있다.
+    예전에는 (판매사, 상품명, 주문번호)가 기존 초안과 정확히 일치하는 행만 찾아
+    매입단가만 콕 집어 고쳤는데, 담당자가 엑셀에서 정렬/복사하다가 상품명이나
+    주문번호가 밀리면 매칭 자체가 안 돼서 "분명히 고쳤는데 반영이 안 됨" 문제가
+    반복됐다. 담당자가 올린 파일 자체가 그 사이트에 대한 "최종 확정본"이라고 보고,
+    행 단위 매칭 없이 그 사이트 전체를 통째로 교체하는 방식으로 바꿔 이 문제를
+    근본적으로 없앤다. (매입단가뿐 아니라 주문수량·배송비 등 담당자가 고친 다른
+    값도 자동으로 같이 반영되고, 정산가·마진은 항상 우리 규칙으로 다시 계산되므로
+    엑셀에 남아있는 예전 정산가/마진 값을 그대로 신뢰하는 위험도 없다.)
+
+    여러 담당자가 거의 동시에 저장해도 안전하다 — 각자 자기 담당 사이트만
+    지우고 다시 쓰기 때문에, 담당자 간에 서로 다른 사이트를 건드리지 않는다.
     """
-    engine = get_engine()
-    ensure_draft_schema(engine)
-
     def is_owned(site) -> bool:
         return any(kw.lower() in str(site).lower() for kw in keywords)
 
-    owned_reviewed = reviewed_raw[reviewed_raw["판매사"].apply(is_owned)]
-    ignored_rows = len(reviewed_raw) - len(owned_reviewed)
-    changed = 0
+    owned_raw = reviewed_raw[reviewed_raw["판매사"].apply(is_owned)].copy()
+    ignored_rows = len(reviewed_raw) - len(owned_raw)
+
+    if owned_raw.empty:
+        return {
+            "owned_rows": 0, "replaced_rows": 0, "ignored_rows": int(ignored_rows),
+            "needs_review_rows": 0,
+        }
+
+    # 담당자가 고친 매입단가/주문수량/배송비 등을 기준으로 정산가·매입가·마진을
+    # 우리 규칙대로 처음부터 다시 계산한다 (엑셀에 남은 옛 값은 신뢰하지 않음).
+    result = P.process_settlement(owned_raw)
+    owned_site_names = sorted(result.df["판매사"].dropna().unique().tolist())
+
+    engine = get_engine()
+    ensure_draft_schema(engine)
 
     def _write():
-        nonlocal changed
         with engine.begin() as conn:
-            for _, row in owned_reviewed.iterrows():
-                new_cost = row.get("매입단가")
-                if pd.isna(new_cost):
-                    continue
-                site = row["판매사"]
-                product = row["고객선택옵션"]
-                order_no = row.get("판매사주문번호")
-                order_no = "" if pd.isna(order_no) else str(order_no).strip()
-
-                sel = conn.execute(
-                    sa.text(
-                        'SELECT "매입단가", "정산가", "주문수량", "공급사배송비" FROM drafts '
-                        'WHERE "결산일자"=:d AND "판매사"=:s AND "고객선택옵션"=:p '
-                        'AND COALESCE("판매사주문번호",\'\')=:o'
-                    ),
-                    {"d": review_date_str, "s": site, "p": product, "o": order_no},
-                ).fetchone()
-                if sel is None:
-                    continue
-                old_cost, settle, qty, ship = sel
-                if old_cost is not None and float(old_cost) == float(new_cost):
-                    continue
-
-                new_buy = float(new_cost) * (qty or 0) + (ship or 0)
-                new_margin = (settle - new_buy) if settle is not None else None
-                new_rate = (new_margin / settle) if settle else None
-
+            for site in owned_site_names:
                 conn.execute(
-                    sa.text(
-                        'UPDATE drafts SET "매입단가"=:c, "매입가"=:b, "마진"=:m, "마진률"=:r '
-                        'WHERE "결산일자"=:d AND "판매사"=:s AND "고객선택옵션"=:p '
-                        'AND COALESCE("판매사주문번호",\'\')=:o'
-                    ),
-                    {
-                        "c": float(new_cost), "b": new_buy, "m": new_margin, "r": new_rate,
-                        "d": review_date_str, "s": site, "p": product, "o": order_no,
-                    },
+                    sa.text('DELETE FROM drafts WHERE "결산일자"=:d AND "판매사"=:s'),
+                    {"d": review_date_str, "s": site},
                 )
-                changed += 1
+        out = result.df.copy()
+        out.insert(0, "결산일자", review_date_str)
+        out.to_sql("drafts", engine, if_exists="append", index=False)
 
     _run_with_retry(_write)
     return {
-        "owned_rows": int(len(owned_reviewed)),
-        "changed_rows": changed,
+        "owned_rows": int(len(owned_raw)),
+        "replaced_rows": int(len(result.df)),
         "ignored_rows": int(ignored_rows),
+        "needs_review_rows": int(len(result.needs_review)),
     }
 
 
@@ -564,6 +552,13 @@ def build_output_excel(df: pd.DataFrame, excluded: pd.DataFrame, settlement_date
             c.fill = GRAY_FILL
             c.border = THIN_BORDER
         for r in range(10, last_row + 1):
+            # 매입가/마진/마진률에 실제 엑셀 수식을 걸어둔다 — 담당자가 매입단가(G열)를
+            # 고치면 나머지 열이 자동으로 재계산되어, 수기로 하나하나 고칠 필요가 없다.
+            # (정산가는 사이트별 수수료 규칙에 따라 달라서 단순 수식 하나로 표현할 수
+            # 없으므로 계산된 값 그대로 둔다.)
+            ws[f"H{r}"] = f"=G{r}*D{r}+E{r}"          # 매입가 = 매입단가×주문수량+공급사배송비
+            ws[f"J{r}"] = f"=I{r}-H{r}"                # 마진 = 정산가-매입가
+            ws[f"K{r}"] = f'=IF(I{r}=0,"",J{r}/I{r})'  # 마진률 = 마진/정산가 (0으로 나누기 방지)
             for col in list("BCDEFGHIJKLMN"):
                 ws[f"{col}{r}"].border = THIN_BORDER
             for col in ["E", "F", "G", "H", "I", "J"]:
@@ -861,16 +856,21 @@ with tab_upload:
                             st.error(f"파일을 읽는 중 오류가 발생했습니다: {e}")
                             reviewed_raw = None
                         if reviewed_raw is not None:
-                            stats = apply_reviewer_corrections_to_db(review_date_str, reviewed_raw, keywords)
-                            log_review(review_date_str, name, stats["changed_rows"])
+                            stats = apply_reviewer_file_to_db(review_date_str, reviewed_raw, keywords)
+                            log_review(review_date_str, name, stats["replaced_rows"])
                             working_df, review_excluded = load_draft(review_date_str)
                             st.success(
-                                f"담당 {stats['owned_rows']:,}행 중 매입단가 "
-                                f"{stats['changed_rows']:,}건 반영 (저장 완료)"
+                                f"담당 사이트 {stats['owned_rows']:,}행을 새로 계산해 "
+                                f"{stats['replaced_rows']:,}행으로 교체 (저장 완료)"
                             )
                             if stats["ignored_rows"] > 0:
                                 st.caption(
                                     f"※ 다른 담당자 사이트 행 {stats['ignored_rows']:,}건은 무시했습니다."
+                                )
+                            if stats["needs_review_rows"] > 0:
+                                st.warning(
+                                    f"⚠ {stats['needs_review_rows']:,}건은 정산 규칙이 없어 "
+                                    "정산가를 계산하지 못했습니다 (규칙 관리 탭에서 확인해 주세요)."
                                 )
 
         st.caption(
