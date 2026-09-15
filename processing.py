@@ -79,9 +79,14 @@ FIXED_PRICE_PATH = DATA_DIR / "fixed_price_table.csv"
 
 
 def load_rate_rules() -> list[dict]:
-    if RATE_RULES_PATH.exists():
-        return json.loads(RATE_RULES_PATH.read_text(encoding="utf-8"))
-    return DEFAULT_RATE_RULES
+    saved = json.loads(RATE_RULES_PATH.read_text(encoding="utf-8")) if RATE_RULES_PATH.exists() else []
+    # 코드(DEFAULT_RATE_RULES)에 새 사이트 규칙을 추가해도, 이미 저장된 site_rules.json
+    # 파일에는 자동으로 반영되지 않는다 (파일이 있으면 그 파일만 읽었기 때문). 그래서
+    # 저장된 파일에 없는 키워드만 기본값에서 자동으로 보충해준다 — 이러면 코드에서
+    # 규칙을 추가하는 즉시 적용되고, 사용자가 직접 고친 규칙은 그대로 유지된다.
+    existing_keywords = {r["keyword"] for r in saved}
+    missing_defaults = [r for r in DEFAULT_RATE_RULES if r["keyword"] not in existing_keywords]
+    return saved + missing_defaults
 
 
 def save_rate_rules(rules: list[dict]) -> None:
@@ -90,9 +95,10 @@ def save_rate_rules(rules: list[dict]) -> None:
 
 
 def load_cashdeal_exceptions() -> list[dict]:
-    if CASHDEAL_PATH.exists():
-        return json.loads(CASHDEAL_PATH.read_text(encoding="utf-8"))
-    return DEFAULT_CASHDEAL_EXCEPTIONS
+    saved = json.loads(CASHDEAL_PATH.read_text(encoding="utf-8")) if CASHDEAL_PATH.exists() else []
+    existing_products = {r["상품명"] for r in saved}
+    missing_defaults = [r for r in DEFAULT_CASHDEAL_EXCEPTIONS if r["상품명"] not in existing_products]
+    return saved + missing_defaults
 
 
 def save_cashdeal_exceptions(rows: list[dict]) -> None:
@@ -151,6 +157,9 @@ def read_raw_settlement(file) -> pd.DataFrame:
 
     for num_col in ["주문수량", "공급사배송비", "결제금액", "매입단가"]:
         out[num_col] = pd.to_numeric(out[num_col], errors="coerce").fillna(0)
+    for num_col in ["매입가", "정산가", "마진", "마진률"]:
+        if num_col in out.columns:
+            out[num_col] = pd.to_numeric(out[num_col], errors="coerce")
 
     if "판매사주문번호" in out.columns:
         out["판매사주문번호"] = out["판매사주문번호"].apply(_normalize_order_no)
