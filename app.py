@@ -231,18 +231,15 @@ def load_draft(date_str: str) -> tuple[pd.DataFrame, pd.DataFrame]:
 def apply_reviewer_file_to_db(
     review_date_str: str, reviewed_raw: pd.DataFrame, keywords: list[str],
 ) -> dict:
-    """담당자가 올린 검토 파일에서 자기 담당 사이트 행을 통째로 뽑아, 처음부터 다시
-    계산(process_settlement)한 뒤, 기존 초안(DB)의 그 사이트 행들을 전부 삭제하고
-    새로 계산한 값으로 바꿔치기한다.
+    """담당자가 올린 검토 파일에서 자기 담당 사이트 행을 통째로 뽑아, 기존 초안(DB)의
+    그 사이트 행들을 전부 삭제하고 담당자 파일에 적힌 값 그대로 바꿔치기한다.
 
-    예전에는 (판매사, 상품명, 주문번호)가 기존 초안과 정확히 일치하는 행만 찾아
-    매입단가만 콕 집어 고쳤는데, 담당자가 엑셀에서 정렬/복사하다가 상품명이나
-    주문번호가 밀리면 매칭 자체가 안 돼서 "분명히 고쳤는데 반영이 안 됨" 문제가
-    반복됐다. 담당자가 올린 파일 자체가 그 사이트에 대한 "최종 확정본"이라고 보고,
-    행 단위 매칭 없이 그 사이트 전체를 통째로 교체하는 방식으로 바꿔 이 문제를
-    근본적으로 없앤다. (매입단가뿐 아니라 주문수량·배송비 등 담당자가 고친 다른
-    값도 자동으로 같이 반영되고, 정산가·마진은 항상 우리 규칙으로 다시 계산되므로
-    엑셀에 남아있는 예전 정산가/마진 값을 그대로 신뢰하는 위험도 없다.)
+    매입단가/매입가/정산가/마진/마진률 등 어떤 열도 다시 계산하지 않는다 — 담당자가
+    올린 파일이 그 사이트에 대한 "최종 확정본"이라고 보고, 파일에 있는 값을 그대로
+    신뢰한다. (전에는 여기서 정산가 등을 우리 규칙으로 다시 계산했는데, 그러면 상품이
+    '고정 정산단가' 표에 등록되어 있는지, 사이트 규칙이 최신인지 등에 따라 담당자가
+    올린 값과 살짝 달라지는 경우가 있었다. "4번에 올린 파일 = 5번 최종본"이 항상
+    정확히 같아야 하므로, 이 단계에서는 재계산을 완전히 없앴다.)
 
     여러 담당자가 거의 동시에 저장해도 안전하다 — 각자 자기 담당 사이트만
     지우고 다시 쓰기 때문에, 담당자 간에 서로 다른 사이트를 건드리지 않는다.
@@ -254,15 +251,12 @@ def apply_reviewer_file_to_db(
     ignored_rows = len(reviewed_raw) - len(owned_raw)
 
     if owned_raw.empty:
-        return {
-            "owned_rows": 0, "replaced_rows": 0, "ignored_rows": int(ignored_rows),
-            "needs_review_rows": 0,
-        }
+        return {"owned_rows": 0, "replaced_rows": 0, "ignored_rows": int(ignored_rows)}
 
-    # 담당자가 고친 매입단가/주문수량/배송비 등을 기준으로 정산가·매입가·마진을
-    # 우리 규칙대로 처음부터 다시 계산한다 (엑셀에 남은 옛 값은 신뢰하지 않음).
-    result = P.process_settlement(owned_raw)
-    owned_site_names = sorted(result.df["판매사"].dropna().unique().tolist())
+    if "적용규칙" not in owned_raw.columns:
+        owned_raw["적용규칙"] = None
+
+    owned_site_names = sorted(owned_raw["판매사"].dropna().unique().tolist())
 
     engine = get_engine()
     ensure_draft_schema(engine)
@@ -274,16 +268,15 @@ def apply_reviewer_file_to_db(
                     sa.text('DELETE FROM drafts WHERE "결산일자"=:d AND "판매사"=:s'),
                     {"d": review_date_str, "s": site},
                 )
-        out = result.df.copy()
+        out = owned_raw.copy()
         out.insert(0, "결산일자", review_date_str)
         out.to_sql("drafts", engine, if_exists="append", index=False)
 
     _run_with_retry(_write)
     return {
         "owned_rows": int(len(owned_raw)),
-        "replaced_rows": int(len(result.df)),
+        "replaced_rows": int(len(owned_raw)),
         "ignored_rows": int(ignored_rows),
-        "needs_review_rows": int(len(result.needs_review)),
     }
 
 
@@ -755,16 +748,50 @@ with tab_upload:
                 )
             else:
                 st.warning(
-                    "⚠ 이 날짜는 이미 담당자 검토가 진행 중인 데이터가 있습니다. 지금 다시 계산한 "
-                    "값으로 덮어쓰면 지금까지의 담당자 검토 내용이 사라집니다."
+                    "⚠ 이 날짜는 이미 담당자 검토가 진행 중인 데이터가 있습니다. "
+                    "(예: 하루 중 주문이 추가로 들어와서 취합 결산서를 다시 올리는 경우)"
                 )
-                if st.button(
-                    "이 날짜의 검토 데이터를 지금 계산한 값으로 초기화 (기존 검토 내용 삭제됨)",
-                    key="reset_draft",
-                ):
-                    save_draft(result.df, result.excluded, settlement_date)
-                    st.success("초기화했습니다.")
-                    st.rerun()
+                review_status_now = get_review_status(settlement_date.isoformat())
+                reviewed_names_now = list(review_status_now.keys())
+                reviewed_sites_now = {
+                    site
+                    for name in reviewed_names_now
+                    for site in P.REVIEWER_SITE_KEYWORDS.get(name, [])
+                }
+
+                col_reset1, col_reset2 = st.columns(2)
+                with col_reset1:
+                    st.caption(
+                        f"이미 검토 완료: {', '.join(reviewed_names_now) if reviewed_names_now else '없음'}"
+                    )
+                    if st.button(
+                        "✅ 검토 안 된 사이트만 새로 반영 (이미 검토한 사이트는 그대로 유지)",
+                        key="smart_merge_draft",
+                        type="primary",
+                        disabled=not reviewed_names_now,
+                    ):
+                        # 이미 검토 끝난 사이트는 기존 초안 그대로 두고, 나머지(검토 전 또는
+                        # 새로 늘어난 주문 포함)만 방금 새로 계산한 값으로 교체한다. 이렇게 해야
+                        # 하루 중 주문이 추가돼 다시 처리해도 담당자가 이미 끝낸 검토 내용이
+                        # 지워지지 않는다.
+                        kept = existing_draft_df[existing_draft_df["판매사"].isin(reviewed_sites_now)]
+                        fresh = result.df[~result.df["판매사"].isin(reviewed_sites_now)]
+                        merged_df = pd.concat([kept, fresh], ignore_index=True)
+                        save_draft(merged_df, result.excluded, settlement_date)
+                        st.success(
+                            f"반영했습니다 — 검토 완료된 {len(reviewed_sites_now):,}개 사이트는 "
+                            "그대로 유지하고, 나머지 사이트만 새로 계산했습니다."
+                        )
+                        st.rerun()
+                with col_reset2:
+                    st.caption("검토 내용까지 포함해서 전부 다시 계산하고 싶을 때만 사용하세요.")
+                    if st.button(
+                        "🗑 전체 초기화 (기존 검토 내용 전부 삭제됨)",
+                        key="reset_draft",
+                    ):
+                        save_draft(result.df, result.excluded, settlement_date)
+                        st.success("초기화했습니다.")
+                        st.rerun()
 
     elif not _existing_df.empty:
         # 이번 세션에서는 파일을 새로 안 올렸지만, 이미 저장된 날짜라면 그 저장된 내용을
@@ -860,17 +887,12 @@ with tab_upload:
                             log_review(review_date_str, name, stats["replaced_rows"])
                             working_df, review_excluded = load_draft(review_date_str)
                             st.success(
-                                f"담당 사이트 {stats['owned_rows']:,}행을 새로 계산해 "
-                                f"{stats['replaced_rows']:,}행으로 교체 (저장 완료)"
+                                f"담당 사이트 {stats['owned_rows']:,}행을 올리신 파일 값 그대로 "
+                                f"반영했습니다 (저장 완료)"
                             )
                             if stats["ignored_rows"] > 0:
                                 st.caption(
                                     f"※ 다른 담당자 사이트 행 {stats['ignored_rows']:,}건은 무시했습니다."
-                                )
-                            if stats["needs_review_rows"] > 0:
-                                st.warning(
-                                    f"⚠ {stats['needs_review_rows']:,}건은 정산 규칙이 없어 "
-                                    "정산가를 계산하지 못했습니다 (규칙 관리 탭에서 확인해 주세요)."
                                 )
 
         st.caption(
