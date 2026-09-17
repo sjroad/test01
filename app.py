@@ -357,8 +357,83 @@ def get_review_status(date_str: str) -> dict[str, dict]:
 
 
 # ---------------------------------------------------------------------------
-# 최종 결산서(xlsx) 생성
+# 결산서 파일 보관함
+#
+# 3번/5번에서 다운로드 버튼을 누르면, 그 순간 만들어진 엑셀 파일이 그 사람 컴퓨터
+# 다운로드 폴더로만 가고 서버에는 전혀 안 남는다. "그동안 받은 최종본 파일들을 한
+# 곳에서 모아 보고 싶다"는 요청에 따라, 다운로드할 때마다 같은 파일을 클라우드
+# DB에도 자동으로 같이 저장해두고, 별도 탭에서 목록으로 보고 다시 받을 수 있게 한다.
 # ---------------------------------------------------------------------------
+
+def ensure_file_archive_schema(engine: sa.Engine):
+    key = "file_archive"
+    if key in _SCHEMA_DONE:
+        return
+
+    def _create():
+        with engine.begin() as conn:
+            conn.execute(sa.text(
+                """
+                CREATE TABLE IF NOT EXISTS file_archive (
+                    "id" TEXT, "결산일자" TEXT, "파일종류" TEXT, "파일명" TEXT,
+                    "생성시각" TEXT, "파일데이터" BYTEA
+                )
+                """
+            ))
+
+    _run_with_retry(_create)
+    _SCHEMA_DONE.add(key)
+
+
+def archive_file(date_str: str, file_type: str, filename: str, data: bytes):
+    """다운로드 버튼을 누른 순간(on_click) 호출되어, 그 파일을 그대로 클라우드에 저장한다."""
+    engine = get_engine()
+    ensure_file_archive_schema(engine)
+    import uuid
+
+    def _write():
+        with engine.begin() as conn:
+            conn.execute(
+                sa.text(
+                    'INSERT INTO file_archive ("id","결산일자","파일종류","파일명","생성시각","파일데이터") '
+                    "VALUES (:id, :d, :t, :f, :ts, :data)"
+                ),
+                {
+                    "id": str(uuid.uuid4()), "d": date_str, "t": file_type, "f": filename,
+                    "ts": datetime.now().isoformat(timespec="seconds"), "data": data,
+                },
+            )
+
+    _run_with_retry(_write)
+
+
+def list_archived_files() -> pd.DataFrame:
+    engine = get_engine()
+    try:
+        ensure_file_archive_schema(engine)
+        return _run_with_retry(lambda: pd.read_sql(
+            'SELECT "id","결산일자","파일종류","파일명","생성시각" FROM file_archive '
+            'ORDER BY "생성시각" DESC',
+            engine,
+        ))
+    except Exception:
+        return pd.DataFrame()
+
+
+def load_archived_file(file_id: str) -> bytes | None:
+    engine = get_engine()
+    ensure_file_archive_schema(engine)
+    try:
+        row = _run_with_retry(lambda: pd.read_sql(
+            sa.text('SELECT "파일데이터" FROM file_archive WHERE "id" = :id'),
+            engine, params={"id": file_id},
+        ))
+    except Exception:
+        return None
+    if row.empty:
+        return None
+    return bytes(row.iloc[0]["파일데이터"])
+
 
 ACCOUNTING_FMT = '_-* #,##0_-;-* #,##0_-;_-* "-"_-;_-@_-'
 DATE_HDR_FMT = r'mm"월" dd"일"'
@@ -671,8 +746,8 @@ def render_result_summary(result: "P.ProcessResult"):
 
 st.title("📊 산지로드 결산 자동화 대시보드")
 
-tab_upload, tab_dashboard, tab_dashboard_monthly, tab_search, tab_rules = st.tabs(
-    ["📥 결산서 업로드/처리", "🥧 대시보드", "📅 대시보드(월간누적)", "🔍 검색", "⚙️ 규칙 관리"]
+tab_upload, tab_dashboard, tab_dashboard_monthly, tab_search, tab_archive, tab_rules = st.tabs(
+    ["📥 결산서 업로드/처리", "🥧 대시보드", "📅 대시보드(월간누적)", "🔍 검색", "📁 파일 보관함", "⚙️ 규칙 관리"]
 )
 
 # ---------------------------------------------------------------------------
@@ -812,12 +887,16 @@ with tab_upload:
             st.success(f"{settlement_date} 데이터를 누적 DB에 저장했습니다.")
             st.session_state["_reload_db"] = True
     with col_b:
+        _excel_bytes_3 = build_output_excel(result.df, result.excluded, settlement_date) if result is not None else b""
+        _filename_3 = f"{settlement_date.strftime('%m%d')}_산지로드_결산_최종.xlsx"
         st.download_button(
             "⬇️ 결산서 최종본 다운로드 (.xlsx)",
-            data=build_output_excel(result.df, result.excluded, settlement_date) if result is not None else b"",
-            file_name=f"{settlement_date.strftime('%m%d')}_산지로드_결산_최종.xlsx",
+            data=_excel_bytes_3,
+            file_name=_filename_3,
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             disabled=result is None,
+            on_click=archive_file,
+            args=(settlement_date.isoformat(), "최종본", _filename_3, _excel_bytes_3),
         )
     if result is None:
         st.caption("먼저 1번에서 취합 결산서를 업로드하면 활성화됩니다.")
@@ -919,16 +998,23 @@ with tab_upload:
             save_to_db(working_df, review_date_obj)
             st.success(f"{review_date_obj} 데이터를(검토 반영본) 누적 DB에 저장했습니다.")
     with col_d:
+        _excel_bytes_5 = build_output_excel(working_df, review_excluded, review_date_obj) if has_review else b""
+        _filename_5 = (
+            f"{review_date_obj.strftime('%m%d')}_산지로드_결산_최종_검토반영.xlsx"
+            if review_date_obj else "결산_최종_검토반영.xlsx"
+        )
         st.download_button(
             "⬇️ 결산서 최종본 다운로드 (검토 반영, .xlsx)",
-            data=build_output_excel(working_df, review_excluded, review_date_obj) if has_review else b"",
-            file_name=(
-                f"{review_date_obj.strftime('%m%d')}_산지로드_결산_최종_검토반영.xlsx"
-                if review_date_obj else "결산_최종_검토반영.xlsx"
-            ),
+            data=_excel_bytes_5,
+            file_name=_filename_5,
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             key="download_reviewed",
             disabled=not has_review,
+            on_click=archive_file,
+            args=(
+                review_date_obj.isoformat() if review_date_obj else "",
+                "검토반영본", _filename_5, _excel_bytes_5,
+            ),
         )
     if not has_review:
         st.caption("먼저 1번에서 취합 결산서를 업로드하면 활성화됩니다.")
@@ -1092,6 +1178,46 @@ with tab_search:
 
             csv_bytes = filtered.to_csv(index=False).encode("utf-8-sig")
             st.download_button("⬇️ 검색 결과 CSV 다운로드", data=csv_bytes, file_name="검색결과.csv")
+
+# ---------------------------------------------------------------------------
+# 탭: 파일 보관함
+#
+# 3번/5번에서 다운로드 버튼을 누를 때마다 자동으로 여기에도 같은 파일이 쌓인다.
+# 각자 컴퓨터 다운로드 폴더에만 있던 최종본 파일들을 한 곳에서 모아 보고 다시
+# 받을 수 있게 하기 위함.
+# ---------------------------------------------------------------------------
+with tab_archive:
+    st.subheader("결산서 최종본 파일 보관함")
+    st.caption(
+        "3번/5번에서 '결산서 최종본 다운로드' 버튼을 누를 때마다 그 파일이 자동으로 "
+        "여기에도 저장됩니다. 각자 컴퓨터 다운로드 폴더를 뒤질 필요 없이 여기서 "
+        "예전 파일을 다시 받을 수 있습니다."
+    )
+    archived = list_archived_files()
+    if archived.empty:
+        st.info("아직 보관된 파일이 없습니다. 3번 또는 5번에서 다운로드 버튼을 누르면 여기에 쌓입니다.")
+    else:
+        dates_avail = sorted(archived["결산일자"].dropna().unique().tolist(), reverse=True)
+        sel_dates_arc = st.multiselect(
+            "결산일자로 좁혀보기 (비워두면 전체)", dates_avail, key="archive_date_filter"
+        )
+        view_archived = (
+            archived[archived["결산일자"].isin(sel_dates_arc)] if sel_dates_arc else archived
+        )
+        st.write(f"보관된 파일: {len(view_archived):,}건")
+
+        for _, row in view_archived.iterrows():
+            col_info, col_dl = st.columns([4, 1])
+            with col_info:
+                st.write(f"**{row['파일명']}**  ·  {row['파일종류']}  ·  {row['생성시각']}")
+            with col_dl:
+                file_bytes = load_archived_file(row["id"])
+                st.download_button(
+                    "다시 받기", data=file_bytes or b"", file_name=row["파일명"],
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key=f"archive_dl_{row['id']}", disabled=file_bytes is None,
+                )
+            st.divider()
 
 # ---------------------------------------------------------------------------
 # 탭 4: 규칙 관리
