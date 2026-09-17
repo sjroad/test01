@@ -32,7 +32,7 @@ DEFAULT_RATE_RULES = [
      "note": "주문배송관리 파일 미제공 시 fallback 요율."},
     {"keyword": "지마켓", "type": "same_as_payment", "rate": 1.0, "note": ""},
     {"keyword": "옥션", "type": "same_as_payment", "rate": 1.0, "note": ""},
-    {"keyword": "제이슨딜", "type": "same_as_payment", "rate": 1.0, "note": ""},
+    {"keyword": "제이슨", "type": "same_as_payment", "rate": 1.0, "note": ""},
     {"keyword": "GS SHOP", "type": "same_as_payment", "rate": 1.0, "note": ""},
     {"keyword": "NS홈쇼핑", "type": "same_as_payment", "rate": 1.0, "note": ""},
     {"keyword": "11번가", "type": "same_as_payment", "rate": 1.0, "note": ""},
